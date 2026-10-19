@@ -80,6 +80,7 @@ pub enum Request {
     /// → one or more [`Response::Collected`].
     RecordSync {
         peer: ReplicaId,
+        #[serde(deserialize_with = "crate::budget::vec")]
         tombstones: Vec<(RelPath, VersionVector, PeerState)>,
         retention: Duration,
         more: bool,
@@ -93,6 +94,7 @@ pub enum Request {
     ReadBlocks {
         path: RelPath,
         expect: Kind,
+        #[serde(deserialize_with = "crate::budget::vec")]
         blocks: Vec<u32>,
     },
     /// v2. Always followed by a content stream: the blocks `delta` does not
@@ -120,6 +122,7 @@ pub enum Response {
     /// A batch of [`Request::ChangesSince`]'s answer, in seq order; every
     /// batch but the last has `more` set.
     Changes {
+        #[serde(deserialize_with = "crate::budget::vec")]
         entries: Vec<(RelPath, Entry)>,
         more: bool,
     },
@@ -132,6 +135,7 @@ pub enum Response {
     /// A batch of the paths whose tombstones [`Request::RecordSync`]
     /// removed; every batch but the last has `more` set.
     Collected {
+        #[serde(deserialize_with = "crate::budget::vec")]
         paths: Vec<RelPath>,
         more: bool,
     },

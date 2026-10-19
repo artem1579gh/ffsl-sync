@@ -3,4 +3,6 @@ pub mod hasher;
 pub mod scanner;
 
 pub use hasher::Hasher;
-pub use scanner::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
+pub use scanner::{
+    DEFAULT_RACY_WINDOW, MAX_LISTED, MAX_LISTED_BYTES, ScanStats, Scanner, Scope, coalesce,
+};

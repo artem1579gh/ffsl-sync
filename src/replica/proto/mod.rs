@@ -49,6 +49,13 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// allocate for one message.
 pub const MAX_FRAME: usize = 32 << 20;
 
+/// The memory one frame's message may take once decoded, beyond the frame's
+/// own bytes: the buffers of its lists and the allocations of its paths
+/// ([`crate::budget`]). Legitimate messages stay well below it: the largest,
+/// an `ApplyDelta` of [`MAX_BLOCKS`](crate::replica::delta::MAX_BLOCKS)
+/// blocks, is charged at most 40 MiB.
+pub const DECODE_BUDGET: usize = 2 * MAX_FRAME;
+
 /// The content bytes per [`Content::Chunk`].
 pub const CHUNK_SIZE: usize = 64 << 10;
 
@@ -1175,6 +1182,56 @@ mod tests {
             read_frame::<_, Request>(&mut Failing),
             Err(Error::Io { .. })
         ));
+    }
+
+    /// The body of `Request::Scan { scope: Paths(n empty paths) }`: 1 byte a
+    /// path on the wire, 24 in memory (issue #5).
+    fn scan_of_empty_paths(n: usize) -> Vec<u8> {
+        let mut body = vec![0, 1]; // Request::Scan, Scope::Paths
+        let mut len = n;
+        while len >= 0x80 {
+            body.push(len as u8 | 0x80);
+            len >>= 7;
+        }
+        body.push(len as u8);
+        body.resize(body.len() + n, 0);
+        body
+    }
+
+    #[test]
+    fn decoded_size_is_bounded() {
+        // About 24 MiB once decoded: fine.
+        let n = 1 << 20;
+        let Some(Request::Scan {
+            scope: Scope::Paths(paths),
+        }) = read_frame(&mut &raw(&scan_of_empty_paths(n))[..]).unwrap()
+        else {
+            panic!("not a scan");
+        };
+        assert_eq!(paths.len(), n);
+        // A 4 MiB frame that would decode to about 96 MiB.
+        let e = read_err::<Request>(&raw(&scan_of_empty_paths(4 << 20)));
+        assert!(e.contains("bytes of memory once decoded"), "{e}");
+
+        // The largest legitimate message decodes: a delta of MAX_BLOCKS blocks.
+        let blocks = crate::replica::delta::MAX_BLOCKS as usize;
+        let delta = Request::ApplyDelta {
+            path: p(b"big"),
+            op: Op::Delete { vv: vv(&[(1, 1)]) },
+            pre: Precondition::Absent,
+            delta: Delta {
+                blocks: Blocks {
+                    size: blocks as u64 * crate::replica::delta::BLOCK_SIZE,
+                    hashes: vec![[7; 32]; blocks],
+                },
+                reuse: vec![Some(u32::MAX); blocks],
+            },
+        };
+        let bytes = frame(&delta);
+        assert_eq!(
+            read_frame::<_, Request>(&mut &bytes[..]).unwrap(),
+            Some(delta)
+        );
     }
 
     #[test]

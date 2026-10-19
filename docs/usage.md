@@ -406,6 +406,18 @@ files_sync daemon paper
 
 The daemon reconnects by itself if the connection drops. Either replica can be remote, or both.
 
+### Limits of `serve`
+
+Anyone who can reach `serve`'s port can open a connection, until the TLS handshake shows that it is not the pinned peer. So `serve` bounds what a connection can take:
+
+- **Connections:** at most 64 at a time. At most 8 of them may still be in their handshake, and at most 4 of those from one IP address. A connection over a limit is closed at once. The peer needs 2 or 3.
+- **Handshake:** the whole handshake (TLS, then the protocol's) must be done within 10 s of the connection.
+- **Requests:** once a request has arrived, the client must keep sending or reading. If it makes no progress for 60 s, its connection is closed. While a file is being uploaded, other requests wait for it, so a client stopped in the middle of an upload (e.g. a `sync --once` suspended with Ctrl-Z) holds them up for at most 60 s. It never holds up stopping `serve`. Between requests, a connection may stay idle for as long as the client likes.
+- **Memory:** a message may take at most 64 MiB of memory once decoded, on top of its own bytes (at most 32 MiB). The list of tombstones at the end of each sync cycle is cut down to the server's own tombstones as it arrives.
+- **Scans:** a scan tells the other side about at most 10 000 paths that changed while it ran (when there are more, their parent directories are rescanned instead) and 10 000 paths it could not scan (the server's log has them all). The same holds for the paths the other side asks to rescan.
+
+These limits are not configurable. Rejected handshakes are logged at `debug` only, since anyone can cause them. To see why the peer cannot connect, run `serve` with `RUST_LOG=info,files_sync::server=debug`.
+
 ### Trying it on one machine
 
 This simulates the two hosts with two state directories, and serves B on `127.0.0.1`:
@@ -500,6 +512,7 @@ sandboxed
 **Logging** goes to stderr and is controlled by `RUST_LOG`. The default is `info`, which also prints each replica's filesystem feature check and a one-line summary per sync cycle. Some useful values:
 - `RUST_LOG=warn`: warnings and errors only.
 - `RUST_LOG=files_sync=debug`: detailed per-path decisions, for bug reports, and the bytes sent and received over the network.
+- `RUST_LOG=info,files_sync::server=debug` for `serve`: also the connections it rejected before or during their TLS handshake, and why (see [Limits of `serve`](#limits-of-serve)).
 
 ## 9. Command reference
 
@@ -603,5 +616,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
 | Warning `this replica was synced before, but its index is new (lost or deleted?)` | The replica's index was deleted (or lost) since its last sync. Its files were kept: differences with the other side are pushed there or become conflict copies, and files deleted since the last sync come back. See **Lost or restored index** in [§2](#2-concepts). |
 | `held back N deletion(s) in …: more than 50% of its M entries` | One side lost most of its files since the last sync, and the mass-deletion guard kept the other side from following. If that was intended, run `sync --once --allow-mass-delete`. See [§2](#2-concepts). |
+| `sync` cannot connect to `serve`, and `serve` logs nothing about it | `serve` logs rejected TLS handshakes (e.g. a certificate that is not the pinned one) at `debug` only. Run it with `RUST_LOG=info,files_sync::server=debug`. A host with 4 handshakes in progress (e.g. a port scanner on the same address) gets its new connections closed at once, until its handshakes end (at most 10 s). See [Limits of `serve`](#limits-of-serve). |
+| `serve` warns `too many connections; closing a new one` | The peer has 64 connections open at once. It needs 2 or 3; check for many `sync` or `daemon` processes of the pair. |
 | `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. `.~fsync.trash` is the trash, if `trash_days` is set. |
 | I need a file back that a sync replaced or deleted | Look in `.~fsync.trash` at the top of that replica's root, if `trash_days` is set there (see **Trash** in [§2](#2-concepts)). Otherwise it is gone, unless the other replica still has it. Consider turning the trash on. |

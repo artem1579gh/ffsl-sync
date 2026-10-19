@@ -13,18 +13,27 @@
 //! watcher, fanned out to every hint connection). The client uses a
 //! separate connection for it ([`crate::replica::RemoteReplica`]).
 //!
+//! The server is reachable by anyone before the TLS handshake, so what a
+//! connection may take is bounded ([`Limits`], issue #5): the number of
+//! connections and of handshakes in progress (in all and per IP address), a
+//! deadline for the whole handshake, and a timeout for a client that stops
+//! sending or reading in the middle of a request (an upload holds the
+//! replica's lock). Each frame's decoded size is bounded by the protocol
+//! ([`crate::budget`]), and a `RecordSync` list by the replica's own
+//! tombstones.
+//!
 //! Quarantined old inodes are swept after every `RecordSync` (the end of a
 //! peer's sync cycle) and when their grace period ends ([`ServerHandle::sweep`]).
 //! With [`Server::status_dir`], a [`ServedReport`] for `status` is saved at
 //! start, after every `RecordSync` and after every sweep (the index is
 //! locked while the server runs).
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -34,17 +43,55 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use crate::config::{PairConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
+use crate::index::{PeerState, VersionVector};
 use crate::replica::proto::{
     BATCH_BYTES, CLOCK_VERSION, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request,
     Response, WireError, batches, read_frame, send_content, server_handshake_upto, write_frame,
 };
-use crate::replica::remote::{HANDSHAKE_TIMEOUT, tune_socket};
+use crate::replica::remote::tune_socket;
 use crate::replica::{ContentReader, LocalReplica, Replica};
 use crate::status::ServedReport;
 use crate::tls::Identity;
 use crate::watch::Hint;
 
 type Tls = StreamOwned<ServerConnection, TcpStream>;
+
+/// The most counters a peer's tombstone vector in a `RecordSync` may have.
+/// A pair's vectors have one per replica; this only stops a peer from
+/// making every one of our tombstones cost megabytes.
+const MAX_PEER_COUNTERS: usize = 64;
+
+/// What the clients of a server may take (issue #5). A connection over a
+/// limit is closed at once, before its TLS handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Open connections, in all (each is a thread and two fds).
+    pub connections: usize,
+    /// Connections still in their TLS or protocol handshake...
+    pub handshakes: usize,
+    /// ... and of those, from one IP address, so that a single host cannot
+    /// take every handshake slot.
+    pub handshakes_per_ip: usize,
+    /// The whole handshake must be done within this time of the accept.
+    pub handshake_deadline: Duration,
+    /// Once a request has arrived, every read and write of the client's
+    /// connection must make progress within this time until it is answered
+    /// (a client stopped in the middle of an upload holds up every other
+    /// request). Between requests, a connection may idle for ever.
+    pub request_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits {
+            connections: 64,
+            handshakes: 8,
+            handshakes_per_ip: 4,
+            handshake_deadline: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(60),
+        }
+    }
+}
 
 /// The replica and its peer, as served.
 pub struct Server {
@@ -53,6 +100,7 @@ pub struct Server {
     tls: Arc<ServerConfig>,
     max_version: u32,
     status_dir: Option<PathBuf>,
+    limits: Limits,
 }
 
 impl Server {
@@ -67,7 +115,14 @@ impl Server {
             tls,
             max_version: PROTOCOL_VERSION,
             status_dir: None,
+            limits: Limits::default(),
         }
+    }
+
+    /// Replaces the default [`Limits`].
+    pub fn limits(mut self, limits: Limits) -> Server {
+        self.limits = limits;
+        self
     }
 
     /// Saves a [`ServedReport`] in `pair_dir` at start, after every
@@ -108,6 +163,8 @@ impl Server {
             tls: self.tls,
             max_version: self.max_version,
             status_dir: self.status_dir,
+            limits: self.limits,
+            handshakes: Mutex::new(Handshakes::default()),
             addr,
             subscribers: Arc::new(Mutex::new(Vec::new())),
             fanout: AtomicBool::new(false),
@@ -155,10 +212,23 @@ impl ServerHandle {
         self.shared.replica()
     }
 
+    /// The number of open connections.
+    pub fn connections(&self) -> usize {
+        lock(&self.shared.conns).len()
+    }
+
     /// Sweeps the quarantine if an entry is due; returns when the next one
-    /// will be.
+    /// will be. While a request holds the replica, it does not wait: it
+    /// returns a time a little later, to try again then (so a caller that
+    /// also waits for a signal sees it at once).
     pub fn sweep(&self) -> Option<Instant> {
-        let mut replica = self.replica();
+        let mut replica = match self.shared.replica.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return Some(Instant::now() + Duration::from_millis(100));
+            }
+        };
         if replica
             .quarantine()
             .next_deadline()
@@ -228,6 +298,9 @@ struct Shared {
     max_version: u32,
     /// Where the status report goes, if anywhere.
     status_dir: Option<PathBuf>,
+    limits: Limits,
+    /// The connections in their handshake.
+    handshakes: Mutex<Handshakes>,
     /// The address it listens on.
     addr: SocketAddr,
     /// The hint connections' channels.
@@ -263,6 +336,49 @@ impl Shared {
     }
 }
 
+/// The connections in their handshake, in all and per IP address.
+#[derive(Default)]
+struct Handshakes {
+    total: usize,
+    per_ip: HashMap<IpAddr, usize>,
+}
+
+/// A connection's place among the [`Handshakes`], given back when dropped.
+struct HandshakeSlot {
+    shared: Arc<Shared>,
+    ip: IpAddr,
+}
+
+impl HandshakeSlot {
+    /// Takes a place for a connection from `ip`, if the limits allow it.
+    fn take(shared: &Arc<Shared>, ip: IpAddr) -> Option<HandshakeSlot> {
+        let mut hs = lock(&shared.handshakes);
+        let from_ip = hs.per_ip.get(&ip).copied().unwrap_or(0);
+        if hs.total >= shared.limits.handshakes || from_ip >= shared.limits.handshakes_per_ip {
+            return None;
+        }
+        hs.total += 1;
+        hs.per_ip.insert(ip, from_ip + 1);
+        Some(HandshakeSlot {
+            shared: shared.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        let mut hs = lock(&self.shared.handshakes);
+        hs.total -= 1;
+        if let Some(n) = hs.per_ip.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                hs.per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
 fn accept_loop(shared: &Arc<Shared>, listener: TcpListener) {
     for tcp in listener.incoming() {
         if shared.stopping.load(Ordering::SeqCst) {
@@ -277,10 +393,18 @@ fn accept_loop(shared: &Arc<Shared>, listener: TcpListener) {
                 continue;
             }
         };
-        let peer = tcp
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| "?".into());
+        let Ok(addr) = tcp.peer_addr() else { continue };
+        let peer = addr.to_string();
+        // Closed at once (dropped) when over a limit. Handshakes are bounded
+        // more tightly, so the connections over the total are the peer's own.
+        if lock(&shared.conns).len() >= shared.limits.connections {
+            tracing::warn!(%peer, limit = shared.limits.connections, "too many connections; closing a new one");
+            continue;
+        }
+        let Some(slot) = HandshakeSlot::take(shared, addr.ip()) else {
+            tracing::debug!(%peer, "too many handshakes in progress; closing a new connection");
+            continue;
+        };
         let id = shared.next_conn.fetch_add(1, Ordering::Relaxed);
         if let Ok(clone) = tcp.try_clone() {
             lock(&shared.conns).insert(id, clone);
@@ -291,7 +415,7 @@ fn accept_loop(shared: &Arc<Shared>, listener: TcpListener) {
             std::thread::Builder::new()
                 .name(format!("conn-{id}"))
                 .spawn(move || {
-                    match handle(&shared, tcp, &peer) {
+                    match handle(&shared, tcp, &peer, slot) {
                         Ok(()) => tracing::debug!(%peer, "connection closed"),
                         // The client went away (e.g. it dropped a read).
                         Err(e @ Error::Io { .. }) => {
@@ -310,37 +434,90 @@ fn accept_loop(shared: &Arc<Shared>, listener: TcpListener) {
 }
 
 /// Serves one connection until the client closes it.
-fn handle(shared: &Shared, tcp: TcpStream, peer: &str) -> Result<()> {
+fn handle(shared: &Shared, tcp: TcpStream, peer: &str, slot: HandshakeSlot) -> Result<()> {
     tune_socket(&tcp);
-    let timeouts = |tcp: &TcpStream, t: Option<Duration>| {
-        tcp.set_read_timeout(t)
-            .and_then(|()| tcp.set_write_timeout(t))
-            .map_err(|e| Error::io("set socket timeouts", e))
-    };
-    timeouts(&tcp, Some(HANDSHAKE_TIMEOUT))?;
-    let conn = ServerConnection::new(shared.tls.clone()).map_err(|e| Error::Tls {
+    let deadline = Instant::now() + shared.limits.handshake_deadline;
+    let mut conn = ServerConnection::new(shared.tls.clone()).map_err(|e| Error::Tls {
         reason: e.to_string(),
     })?;
-    let mut tls = StreamOwned::new(conn, tcp);
-    while tls.conn.is_handshaking() {
-        if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+    let mut sock = Deadline {
+        tcp: &tcp,
+        deadline,
+    };
+    while conn.is_handshaking() {
+        if let Err(e) = conn.complete_io(&mut sock) {
             // Send the alert, if any, so the client learns why.
-            let _ = tls.conn.complete_io(&mut tls.sock);
-            return Err(Error::Connection {
-                peer: peer.to_owned(),
-                reason: format!("rejected: TLS handshake failed: {e}"),
-            });
+            let _ = conn.complete_io(&mut sock);
+            // Anyone can get this far: not worth more than a debug line.
+            tracing::debug!(%peer, "rejected: TLS handshake failed: {e}");
+            return Ok(());
         }
     }
-    let session = server_handshake_upto(&mut tls, shared.id, shared.peer, shared.max_version)?;
-    timeouts(&tls.sock, None)?;
+    // The client is our peer now (TLS checked its certificate).
+    let mut stream = rustls::Stream::new(&mut conn, &mut sock);
+    let session = server_handshake_upto(&mut stream, shared.id, shared.peer, shared.max_version)?;
+    drop(slot);
+    let mut tls = StreamOwned::new(conn, tcp);
     tracing::debug!(%peer, version = session.version, "client connected");
-    while let Some(req) = read_frame::<_, Request>(&mut tls)? {
+    loop {
+        // Idle between requests for as long as the client likes.
+        timeouts(&tls.sock, None)?;
+        let Some(req) = read_frame::<_, Request>(&mut tls)? else {
+            break;
+        };
+        timeouts(&tls.sock, Some(shared.limits.request_timeout))?;
         if !serve(shared, &mut tls, session.version, req)? {
             break;
         }
     }
     Ok(())
+}
+
+/// Sets the read and write timeouts of `tcp`.
+fn timeouts(tcp: &TcpStream, t: Option<Duration>) -> Result<()> {
+    tcp.set_read_timeout(t)
+        .and_then(|()| tcp.set_write_timeout(t))
+        .map_err(|e| Error::io("set socket timeouts", e))
+}
+
+/// A connection in its handshake: every read and write must be done by
+/// `deadline` (a socket timeout alone would let a client send a byte per
+/// timeout for ever).
+struct Deadline<'a> {
+    tcp: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl Deadline<'_> {
+    /// Sets the socket timeout `set` to the time left.
+    fn arm(&self, set: fn(&TcpStream, Option<Duration>) -> io::Result<()>) -> io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "handshake deadline passed",
+            ));
+        }
+        set(self.tcp, Some(left))
+    }
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.arm(TcpStream::set_read_timeout)?;
+        (&mut &*self.tcp).read(buf)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.arm(TcpStream::set_write_timeout)?;
+        (&mut &*self.tcp).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&mut &*self.tcp).flush()
+    }
 }
 
 /// Sends `result` as the answer: the response, or the error.
@@ -378,7 +555,17 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
     }
     match req {
         Request::Scan { scope } => {
-            let r = shared.replica().scan(scope);
+            let r = shared.replica().scan(scope).map(|mut stats| {
+                // Within a message, whatever the tree.
+                let left_out = stats.bound();
+                if left_out > 0 {
+                    tracing::warn!(
+                        left_out,
+                        "too many paths could not be scanned to tell the peer about them all (see above)"
+                    );
+                }
+                stats
+            });
             answer(tls, r.map(Response::Scanned))?;
         }
         Request::ChangesSince { seq } => {
@@ -464,29 +651,12 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
         }
         Request::RecordSync {
             peer,
-            mut tombstones,
+            tombstones,
             retention,
-            mut more,
+            more,
         } => {
-            while more {
-                match read_frame::<_, Request>(tls)? {
-                    Some(Request::RecordSync {
-                        peer: p,
-                        tombstones: t,
-                        retention: r,
-                        more: m,
-                    }) if p == peer && r == retention => {
-                        tombstones.extend(t);
-                        more = m;
-                    }
-                    _ => {
-                        return Err(Error::Protocol {
-                            reason: "RecordSync batch expected".into(),
-                        });
-                    }
-                }
-            }
-            let removed = {
+            let tombstones = record_sync_list(shared, tls, peer, retention, tombstones, more)?;
+            let removed = tombstones.and_then(|tombstones| {
                 let mut replica = shared.replica();
                 let removed = replica.record_sync(peer, tombstones, retention);
                 // The end of the peer's cycle: what can be leased goes now.
@@ -497,7 +667,7 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
                 // is current.
                 shared.save_status(&replica);
                 removed
-            };
+            });
             match removed {
                 Ok(paths) => {
                     let parts = batches(paths, BATCH_BYTES);
@@ -521,6 +691,66 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
         }
     }
     Ok(true)
+}
+
+/// Reads the rest of a `RecordSync` (whose first batch is `batch`) and
+/// joins its batches into one list. Each batch keeps only the paths that
+/// hold that tombstone in our index now, the last batch naming a path wins,
+/// so the list is never longer than our own tombstones, whatever the peer
+/// sends (issue #5). The outer error is the connection's; the inner one
+/// (the index failed) is the answer, once every batch is read.
+fn record_sync_list(
+    shared: &Shared,
+    tls: &mut Tls,
+    peer: ReplicaId,
+    retention: Duration,
+    mut batch: Vec<(RelPath, VersionVector, PeerState)>,
+    mut more: bool,
+) -> Result<Result<Vec<(RelPath, VersionVector, PeerState)>>> {
+    let mut list = BTreeMap::new();
+    let mut failed = None;
+    loop {
+        if batch.iter().any(|(_, _, state)| {
+            matches!(state, PeerState::Tombstone(vv) if vv.len() > MAX_PEER_COUNTERS)
+        }) {
+            return Err(Error::Protocol {
+                reason: format!("a RecordSync vector of more than {MAX_PEER_COUNTERS} counters"),
+            });
+        }
+        if failed.is_none() {
+            match shared
+                .replica()
+                .index()
+                .retain_current_tombstones(&mut batch)
+            {
+                Ok(()) => list.extend(batch.into_iter().map(|(p, vv, st)| (p, (vv, st)))),
+                Err(e) => failed = Some(e),
+            }
+        }
+        if !more {
+            break;
+        }
+        match read_frame::<_, Request>(tls)? {
+            Some(Request::RecordSync {
+                peer: p,
+                tombstones,
+                retention: r,
+                more: m,
+            }) if p == peer && r == retention => {
+                batch = tombstones;
+                more = m;
+            }
+            _ => {
+                return Err(Error::Protocol {
+                    reason: "RecordSync batch expected".into(),
+                });
+            }
+        }
+    }
+    Ok(match failed {
+        Some(e) => Err(e),
+        None => Ok(list.into_iter().map(|(p, (vv, st))| (p, vv, st)).collect()),
+    })
 }
 
 /// Answers a read (`OpenRead`, `ReadBlocks`): `Reading` and the content,

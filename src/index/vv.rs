@@ -10,6 +10,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
 
+use crate::budget;
 use crate::config::ReplicaId;
 
 /// The largest counter accepted from storage or the wire.
@@ -58,6 +59,11 @@ impl VersionVector {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The number of replicas with a counter.
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
     /// The counter for `id` (0 if absent).
@@ -241,7 +247,8 @@ impl<'de> Deserialize<'de> for VersionVector {
 
 /// Decodes [`Counters`] without trusting the encoded length for the
 /// allocation (smallvec's own impl reserves it up front; a peer's message
-/// could claim millions of counters, design §7.1).
+/// could claim millions of counters, design §7.1), charging the counters
+/// that do not fit inline to the decode budget ([`crate::budget`]).
 struct CountersVisitor;
 
 impl<'de> serde::de::Visitor<'de> for CountersVisitor {
@@ -252,8 +259,13 @@ impl<'de> serde::de::Visitor<'de> for CountersVisitor {
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Counters, A::Error> {
-        let mut counters = Counters::with_capacity(seq.size_hint().unwrap_or(0).min(16));
+        let mut counters = Counters::new();
         while let Some(pair) = seq.next_element()? {
+            if counters.len() == counters.capacity() {
+                // Spilled to the heap: charged to the decode budget.
+                let cap = budget::grow::<(ReplicaId, u64), A::Error>(counters.capacity())?;
+                counters.reserve_exact(cap - counters.len());
+            }
             counters.push(pair);
         }
         Ok(counters)
@@ -277,6 +289,19 @@ mod tests {
     fn arb_vv() -> impl Strategy<Value = VersionVector> {
         prop::collection::vec((0u64..4, 0u64..4), 0..5)
             .prop_map(|v| v.into_iter().map(|(id, c)| (r(id), c)).collect())
+    }
+
+    #[test]
+    fn spilled_counters_are_charged_to_the_decode_budget() {
+        let two = postcard::to_stdvec(&vv(&[(1, 1), (2, 1)])).unwrap();
+        let many: VersionVector = (1..=100).map(|id| (r(id), 1)).collect();
+        let many = postcard::to_stdvec(&many).unwrap();
+        let decode = |b: &[u8]| postcard::from_bytes::<VersionVector>(b);
+        // Two counters are inline: free.
+        assert!(budget::within(0, || decode(&two)).0.is_ok());
+        assert!(budget::within(100, || decode(&many)).1);
+        assert!(budget::within(100 * 16 * 2, || decode(&many)).0.is_ok());
+        assert_eq!(decode(&many).unwrap().len(), 100);
     }
 
     #[test]

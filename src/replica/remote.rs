@@ -505,6 +505,8 @@ impl Replica for RemoteReplica {
     }
 
     fn scan(&mut self, scope: Scope) -> Result<ScanStats> {
+        // Within a message, however many paths are dirty (issue #5).
+        let scope = scope.bounded();
         self.request(&Request::Scan { scope }, |msg| match msg {
             Response::Scanned(stats) => Some(stats),
             _ => None,

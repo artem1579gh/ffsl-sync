@@ -292,6 +292,28 @@ impl IndexStore {
         txn.commit().map_err(dberr)
     }
 
+    /// Keeps only the items of a [`record_sync`](Self::record_sync) list
+    /// that it would act on: those whose path holds a tombstone with
+    /// exactly that vector now. The others only drop their records there,
+    /// which `record_sync` does anyway for every path it is not given. A
+    /// server applies it to each batch as it arrives, so a peer's list never
+    /// grows beyond this index's own tombstones (issue #5).
+    pub fn retain_current_tombstones(
+        &self,
+        tombstones: &mut Vec<(RelPath, VersionVector, PeerState)>,
+    ) -> Result<()> {
+        let txn = self.read()?;
+        let mut err = None;
+        tombstones.retain(|(path, vv, _)| match txn.get(path) {
+            Ok(e) => e.is_some_and(|e| e.kind == Kind::Tombstone && &e.vv == vv),
+            Err(e) => {
+                err.get_or_insert(e);
+                false
+            }
+        });
+        err.map_or(Ok(()), Err)
+    }
+
     /// Records a sync cycle with `peer` at `now_ns` and collects tombstones,
     /// in one (non-durable) transaction; see [`WriteTxn::record_sync`].
     pub fn record_sync(
@@ -1060,6 +1082,24 @@ mod tests {
             .collect();
         let removed = store.record_sync(peer, &seen, now, H).unwrap();
         removed.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn only_current_tombstones_are_retained() {
+        let (_dir, store) = open();
+        let t = tomb(&store, b"t", 1);
+        let mut live = Entry::new(Kind::Dir, 0, 0, t.clone());
+        store.put(&p(b"d"), &mut live).unwrap();
+        let mut old = VersionVector::new();
+        old.set(PEER, 9);
+        let mut list = vec![
+            (p(b"t"), t.clone(), PeerState::Absent),
+            (p(b"t"), old.clone(), PeerState::Absent),
+            (p(b"d"), t.clone(), PeerState::Live),
+            (p(b"gone"), t.clone(), PeerState::Absent),
+        ];
+        store.retain_current_tombstones(&mut list).unwrap();
+        assert_eq!(list, [(p(b"t"), t, PeerState::Absent)]);
     }
 
     #[test]

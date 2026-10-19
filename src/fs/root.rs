@@ -43,8 +43,8 @@ const IN_TREE: ResolveFlags = ResolveFlags::BENEATH
 /// It is either the root itself (empty) or a sequence of components joined by
 /// single `/`s. Components are non-empty and are never `.` or `..`. No path
 /// contains a NUL byte or starts or ends with `/`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
-#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize)]
+#[serde(into = "Vec<u8>")]
 pub struct RelPath(Vec<u8>);
 
 impl RelPath {
@@ -149,6 +149,18 @@ pub fn validate_name(name: &[u8]) -> Result<()> {
         path: name.to_vec(),
         reason,
     })
+}
+
+impl<'de> Deserialize<'de> for RelPath {
+    /// Validates the path, and charges its allocation to the decode budget
+    /// ([`crate::budget`]).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let path = Vec::<u8>::deserialize(d)?;
+        if !path.is_empty() {
+            crate::budget::charge(crate::budget::ALLOC_OVERHEAD)?;
+        }
+        RelPath::new(path).map_err(serde::de::Error::custom)
+    }
 }
 
 impl TryFrom<Vec<u8>> for RelPath {

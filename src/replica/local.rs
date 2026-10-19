@@ -1084,6 +1084,12 @@ impl Replica for LocalReplica {
                 "read_blocks of a block the file does not have",
             ));
         }
+        // Each block at most once, so a read is never longer than the file.
+        let mut sorted = blocks.to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(invalid(path, "read_blocks of a block twice"));
+        }
         let snap = self.index.read()?;
         let cur = indexed_as(&snap, path, expect)?;
         let Some(file) = self.disk().open_pinned(&snap, path, &cur)? else {
@@ -3046,9 +3052,12 @@ mod tests {
             .unwrap();
         assert_eq!(out, [&data[3 * bs..], &data[bs..2 * bs]].concat());
 
-        // Not a block of the file; not the indexed kind.
-        let err = fx.r.read_blocks(&rp("f"), &e.kind, &[4]).err().unwrap();
-        assert!(matches!(err, Error::InvalidOp { .. }), "{err:?}");
+        // Not a block of the file; a block twice (issue #5); not the
+        // indexed kind.
+        for blocks in [&[4][..], &[1, 3, 1]] {
+            let err = fx.r.read_blocks(&rp("f"), &e.kind, blocks).err().unwrap();
+            assert!(matches!(err, Error::InvalidOp { .. }), "{err:?}");
+        }
         let other = Kind::File {
             size: 1,
             hash: [0; 32],

@@ -30,7 +30,7 @@ use crate::fs::RelPath;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Hint {
     /// These paths (and everything beneath them) may have changed: rescan them.
-    Paths(Vec<RelPath>),
+    Paths(#[serde(deserialize_with = "crate::budget::vec")] Vec<RelPath>),
     /// Events were lost (inotify overflow): rescan everything.
     FullRescan,
 }

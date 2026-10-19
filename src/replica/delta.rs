@@ -34,6 +34,7 @@ pub const MAX_BLOCKS: u64 = 1 << 19;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blocks {
     pub size: u64,
+    #[serde(deserialize_with = "crate::budget::vec")]
     pub hashes: Vec<[u8; 32]>,
 }
 
@@ -107,6 +108,7 @@ impl Blocks {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delta {
     pub blocks: Blocks,
+    #[serde(deserialize_with = "crate::budget::vec")]
     pub reuse: Vec<Option<u32>>,
 }
 

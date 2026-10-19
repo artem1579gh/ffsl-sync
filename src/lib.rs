@@ -1,6 +1,7 @@
 //! `files_sync`: a race-free, two-way file synchronizer for Linux with rsync
 //! symlink semantics. See `claude/design.md` for the design.
 
+pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod daemon;

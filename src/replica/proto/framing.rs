@@ -4,7 +4,8 @@
 //! A frame is a 4-byte big-endian length followed by that many bytes: one
 //! postcard-encoded message, with nothing left over. Everything read is
 //! untrusted: a malformed frame is an [`Error::Protocol`], never a panic, and
-//! no allocation is sized by the peer beyond [`MAX_FRAME`].
+//! no allocation is sized by the peer beyond [`MAX_FRAME`]. A message's
+//! decoded collections are bounded by [`DECODE_BUDGET`] ([`crate::budget`]).
 
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
@@ -13,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::messages::{Content, WireError};
-use super::{CHUNK_SIZE, MAX_FRAME};
+use super::{CHUNK_SIZE, DECODE_BUDGET, MAX_FRAME};
 use crate::error::{Error, Result};
 
 fn protocol(reason: impl Into<String>) -> Error {
@@ -73,8 +74,14 @@ pub fn read_frame<R: Read + ?Sized, T: DeserializeOwned>(r: &mut R) -> Result<Op
             body.len()
         )));
     }
-    let (msg, rest) = postcard::take_from_bytes::<T>(&body)
-        .map_err(|e| protocol(format!("malformed message: {e}")))?;
+    let (msg, exceeded) =
+        crate::budget::within(DECODE_BUDGET, || postcard::take_from_bytes::<T>(&body));
+    if exceeded {
+        return Err(protocol(format!(
+            "message of {len} bytes takes more than {DECODE_BUDGET} bytes of memory once decoded"
+        )));
+    }
+    let (msg, rest) = msg.map_err(|e| protocol(format!("malformed message: {e}")))?;
     if !rest.is_empty() {
         return Err(protocol(format!(
             "{} trailing bytes after the message",

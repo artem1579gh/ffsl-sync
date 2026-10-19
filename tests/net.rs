@@ -155,7 +155,8 @@ impl Hosts {
         let mut args = flags.to_vec();
         args.extend(["serve", "p", "b", "--listen", "127.0.0.1:0"]);
         let mut child = bin(self.server.path(), &args)
-            .env("RUST_LOG", "info")
+            // Rejected handshakes are logged at debug (issue #5).
+            .env("RUST_LOG", "info,files_sync::server=debug")
             .stdout(Stdio::piped())
             .stderr(log)
             .spawn()

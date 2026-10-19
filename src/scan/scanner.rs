@@ -70,7 +70,7 @@ pub enum Scope {
     Full,
     /// These paths and everything beneath them. The ancestors of each path
     /// are observed too (not recursively), so they are indexed.
-    Paths(Vec<RelPath>),
+    Paths(#[serde(deserialize_with = "crate::budget::vec")] Vec<RelPath>),
 }
 
 /// What a scan did.
@@ -87,10 +87,121 @@ pub struct ScanStats {
     /// Paths that changed while being scanned, or whose index entry changed
     /// during the scan. Their entries (and subtrees) were left as they were;
     /// rescan them later.
+    #[serde(deserialize_with = "crate::budget::vec")]
     pub dirty: Vec<RelPath>,
     /// Paths that could not be scanned for another reason (logged). Their
     /// entries and subtrees were left as they were.
+    #[serde(deserialize_with = "crate::budget::vec")]
     pub errors: Vec<RelPath>,
+}
+
+/// The most paths a [`Scope::Paths`] or a list of [`ScanStats`] holds on
+/// the wire ([`Scope::bounded`], [`ScanStats::bound`]; issue #5).
+pub const MAX_LISTED: usize = 10_000;
+
+/// The most bytes such a list holds on the wire, about.
+pub const MAX_LISTED_BYTES: usize = 4 << 20;
+
+impl Scope {
+    /// A scope that covers this one in at most [`MAX_LISTED`] paths of
+    /// [`MAX_LISTED_BYTES`] (see [`coalesce`]).
+    pub fn bounded(self) -> Scope {
+        match self {
+            Scope::Paths(paths) => Scope::Paths(coalesce(paths)),
+            full => full,
+        }
+    }
+}
+
+impl ScanStats {
+    /// Bounds the lists to [`MAX_LISTED`] paths of [`MAX_LISTED_BYTES`]
+    /// each, so the stats fit in a message whatever the tree: `dirty` is
+    /// [`coalesce`]d (rescanning an ancestor rescans the paths beneath it),
+    /// `errors` is cut short. Returns how many errors were left out.
+    pub fn bound(&mut self) -> usize {
+        self.dirty = coalesce(std::mem::take(&mut self.dirty));
+        let mut bytes = 0;
+        let keep = self
+            .errors
+            .iter()
+            .take(MAX_LISTED)
+            .take_while(|p| {
+                bytes += listed_bytes(p);
+                bytes <= MAX_LISTED_BYTES
+            })
+            .count();
+        let left_out = self.errors.len() - keep;
+        self.errors.truncate(keep);
+        left_out
+    }
+}
+
+/// About the bytes `p` takes in a list on the wire.
+fn listed_bytes(p: &RelPath) -> usize {
+    p.as_bytes().len() + 5
+}
+
+/// `paths` if they fit in [`MAX_LISTED`] paths of [`MAX_LISTED_BYTES`];
+/// otherwise, sorted, the fewest ancestors needed so that every path is one
+/// of them or beneath one, cut at the greatest depth at which the list
+/// fits (at worst, the root alone).
+pub fn coalesce(paths: Vec<RelPath>) -> Vec<RelPath> {
+    let fits = |paths: &[RelPath]| {
+        paths.len() <= MAX_LISTED
+            && paths.iter().map(listed_bytes).sum::<usize>() <= MAX_LISTED_BYTES
+    };
+    if fits(&paths) {
+        return paths;
+    }
+    let cut = |depth: usize| covering(paths.iter().map(|p| ancestor_at(p, depth)).collect());
+    // The cut list shrinks with the depth; at depth 0 it is the root alone.
+    let (mut lo, mut hi) = (0, paths.iter().map(RelPath::depth).max().unwrap_or(0));
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(&cut(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut out = cut(lo);
+    out.sort();
+    out
+}
+
+/// `p` if it is at most `depth` components deep, else its ancestor at
+/// that depth.
+fn ancestor_at(p: &RelPath, depth: usize) -> RelPath {
+    let b = p.as_bytes();
+    let end = match depth.checked_sub(1) {
+        None => 0,
+        Some(n) => match b.iter().enumerate().filter(|&(_, &c)| c == b'/').nth(n) {
+            Some((i, _)) => i,
+            None => return p.clone(),
+        },
+    };
+    RelPath::new(&b[..end]).expect("a prefix of a path up to a `/` is a path")
+}
+
+/// `paths` without duplicates and without paths beneath another one, in
+/// time linear in their bytes (after sorting): sorted by components, a
+/// path's descendants follow it.
+fn covering(mut paths: Vec<RelPath>) -> Vec<RelPath> {
+    paths.sort_by(|a, b| a.components().cmp(b.components()));
+    let mut out: Vec<RelPath> = Vec::new();
+    for p in paths {
+        // `p` is the last one kept, or beneath it.
+        let covered = out.last().is_some_and(|q| {
+            q.is_root()
+                || p.as_bytes()
+                    .strip_prefix(q.as_bytes())
+                    .is_some_and(|rest| rest.first().is_none_or(|&c| c == b'/'))
+        });
+        if !covered {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Scans one replica into its index.
@@ -1100,5 +1211,60 @@ mod tests {
         let l = f.get("d/e/l");
         assert_eq!(l.kind, f.get("d/x").kind);
         assert!(l.local.via_link.is_some());
+    }
+
+    #[test]
+    fn long_lists_are_coalesced_or_cut_short() {
+        // Short lists are left as they are.
+        let few = vec![rp("b"), rp("a/x"), rp("a")];
+        assert_eq!(coalesce(few.clone()), few);
+        assert_eq!(Scope::Paths(few.clone()).bounded(), Scope::Paths(few));
+
+        // Too many paths: the deepest are lifted to their parents until the
+        // list fits; every path is still covered.
+        let many: Vec<RelPath> = (0..3 * MAX_LISTED)
+            .map(|i| rp(&format!("d{}/e{}/f{i}", i % 3, i % 300)))
+            .chain([rp("top")])
+            .collect();
+        let out = coalesce(many.clone());
+        assert_eq!(out.len(), 300 + 1);
+        assert!(out.contains(&rp("d0/e0")) && out.contains(&rp("top")));
+        assert!(out.is_sorted());
+        let covered: HashSet<&[u8]> = out.iter().map(RelPath::as_bytes).collect();
+        assert!(
+            many.iter()
+                .all(|p| prefixes(p).any(|pre| covered.contains(pre)))
+        );
+
+        // Too many bytes: cut deep enough to fit.
+        let deep = "x/".repeat(2000);
+        let long: Vec<RelPath> = (0..1100).map(|i| rp(&format!("d{i}/{deep}f"))).collect();
+        let cut = coalesce(long.clone());
+        assert_eq!(cut.len(), 1100);
+        assert!(cut.iter().map(listed_bytes).sum::<usize>() <= MAX_LISTED_BYTES);
+        assert!(cut.iter().all(|p| p.depth() > 1000 && p.depth() < 2000));
+        let covered: HashSet<&[u8]> = cut.iter().map(RelPath::as_bytes).collect();
+        assert!(
+            long.iter()
+                .all(|p| prefixes(p).any(|pre| covered.contains(pre)))
+        );
+        // Too many names at the top: the root alone.
+        let wide = (0..2 * MAX_LISTED).map(|i| rp(&format!("t{i}"))).collect();
+        assert_eq!(coalesce(wide), [RelPath::root()]);
+
+        // Stats: dirty paths coalesced, errors cut short and counted.
+        let mut stats = ScanStats {
+            dirty: many,
+            errors: (0..MAX_LISTED + 5)
+                .map(|i| rp(&format!("e{i:06}")))
+                .collect(),
+            ..ScanStats::default()
+        };
+        assert_eq!(stats.bound(), 5);
+        assert_eq!(stats.dirty, out);
+        assert_eq!(stats.errors.len(), MAX_LISTED);
+        assert_eq!(stats.errors[0], rp("e000000"));
+        let encoded = postcard::to_stdvec(&stats).unwrap();
+        assert!(encoded.len() < 2 * MAX_LISTED_BYTES, "{}", encoded.len());
     }
 }
