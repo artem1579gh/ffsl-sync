@@ -2,6 +2,15 @@
 
 All times are UTC.
 
+## 0.1.6 — 2026.10.19 14:11:00
+
+Fixes [issue #5](https://github.com/artem1579gh/files_sync/issues/5): `serve` had no resource limits. Anyone who could reach its port could exhaust its threads and file descriptors before authenticating, and the peer could freeze it or make it allocate far more memory than a message's size suggests.
+
+- **Connections:** at most 64 at a time, of which at most 8 in their handshake (4 from one IP address). A connection over a limit is closed at once. The whole handshake must be done within 10 s. Rejected handshakes are logged at `debug` only.
+- **Stalled clients:** once a request has arrived, a client that makes no progress for 60 s is disconnected, so a client suspended in the middle of an upload holds up the other requests for at most that long, not for ever. `serve` now stops at once on SIGTERM, even then.
+- **Memory:** a message may take at most 64 MiB once decoded, and the tombstone list at the end of a sync cycle is cut down to the server's own tombstones as it arrives. A block read can no longer ask for the same block twice.
+- **Large scans:** a scan reports at most 10 000 changed and 10 000 unscannable paths. More changed paths are rescanned through their parent directories, so a tree with very many unreadable files no longer breaks every sync cycle.
+
 ## 0.1.5 — 2026.10.19 12:19:18
 
 Fixes [issue #4](https://github.com/artem1579gh/files_sync/issues/4): over the network, a malicious peer could plant symlinks that made a replica following links read files outside its root (`copy-links`, `copy-unsafe-links`, `copy-dirlinks`), or write through them (`keep_dirlinks` with `keep_dirlinks_unsafe`).
