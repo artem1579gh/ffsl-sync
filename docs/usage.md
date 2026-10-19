@@ -45,7 +45,7 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
   - `<replica-id>.crt` / `.key`, a TLS identity per replica (used only for network sync);
   - `status.toml`, written by a running daemon, and `status-<replica-id>.toml`, written by a running `serve`.
 
-  The state directory never lives inside a replica.
+  The state directory never lives inside a replica. `init` refuses such a pair, and `sync`, `daemon` and `serve` check again each time they open a replica, by the directories themselves, so symlinks do not hide it. This matters most on a server: serving your home directory with the default state directory (`~/.local/state`) inside it is refused, since it would sync the replica's private key and never stop syncing its own status reports. Point `XDG_STATE_HOME` elsewhere, or serve a subdirectory.
 - **Version vectors:** per-file causal history, as in syncthing. They tell an ordinary update ("B has seen A's last change and edited it again") from a real conflict ("both sides changed the file independently").
 - **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker and the trash below are the ones that stay.
 - **Root marker:** the first sync puts a small file `.~fsync.root.<replica-id>` at the top of each local root, saying which replica the directory is. Like syncthing's `.stfolder`, it guards against an empty directory standing in for the replica. That happens, for example, when the disk behind a root is not mounted and its empty mount point is left. Without the marker, every file in the index would look deleted, and the deletions would be synced to the other side. If the marker is missing, `sync`, `daemon` and `serve` refuse to run for the pair (a daemon whose root loses its marker stops): ``replica root …: its root marker is missing; it may not be the replica's directory (is its disk mounted?)``. To fix it:
@@ -387,7 +387,7 @@ On the host that will run `sync`/`daemon` (here "laptop"), create the pair. Give
 files_sync init paper --a ~/work --b /srv/mirror --b-remote server.example:7777
 ```
 
-`init` prints which files to copy. Copy `config.toml` and B's `<id>.crt` and `<id>.key` to the same state directory on the server (`~/.local/state/fsync/paper/`, or the one under `$XDG_STATE_HOME`). Keep the `.key` private.
+`init` prints which files to copy. Copy `config.toml` and B's `<id>.crt` and `<id>.key` to the same state directory on the server (`~/.local/state/fsync/paper/`, or the one under `$XDG_STATE_HOME`). Keep the `.key` private. That state directory must not lie inside B's root: `serve` refuses to start if it does.
 
 On the server:
 
@@ -606,6 +606,8 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `pair not initialised: …/config.toml not found` | Wrong pair name, or `XDG_STATE_HOME` differs from when you ran `init`. |
 | `` `sync` requires --once `` | `sync` is one-shot only; use `daemon` for continuous sync. |
 | `roots … overlap` | One root is inside the other. Pick two separate directories. |
+| `invalid replica root …: contains the state directory …` (or `lies inside the state directory`) | The root holds the pair's state directory (on a server, e.g. serving `$HOME` with the default `~/.local/state`), or the other way round. Set `XDG_STATE_HOME` to a directory outside the root (and move the pair's state directory there), or pick another root. |
+| `invalid replica root …: contains …, the root of the other replica` (or `lies inside …`, `is also the root …`) | The two roots overlap, perhaps through a symlink, or with both replicas on one host and one of them served. Pick two separate directories. |
 | `pair already initialised` | `init` never overwrites. Delete the pair's state directory to start over: this forgets the sync history, not your files. |
 | A required filesystem feature is missing | The root is on an unsupported filesystem (e.g. `/mnt/c` under WSL, NFS). Move it to ext4, xfs, btrfs or tmpfs. |
 | `index database: Database already open. Cannot acquire lock.` | Another `sync`, `daemon` or `serve` for the same pair holds the index. Run one at a time. |

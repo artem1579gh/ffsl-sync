@@ -539,8 +539,11 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(
         .create(dir)
         .map_err(|e| Error::io(format!("create {}", dir.display()), e))?;
 
+    // A reserved name (`.~fsync.`), which no scan picks up.
+    let name = path.file_name().expect("config path has a file name");
     let tmp = dir.join(format!(
-        ".{CONFIG_FILE}.tmp.{}.{}",
+        ".~fsync.{}.tmp.{}.{}",
+        name.to_string_lossy(),
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));

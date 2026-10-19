@@ -7,6 +7,7 @@
 pub mod caps;
 pub mod commit;
 pub mod hooks;
+pub mod layout;
 pub mod lease;
 pub mod root;
 pub mod stat;

@@ -146,7 +146,8 @@ impl Server {
         let (me, peer) = (&cfg.replicas[side], &cfg.replicas[1 - side]);
         let identity = Identity::load(pair_dir, me.id, me.device()?)?;
         let tls = identity.server_config(peer.device()?)?;
-        let replica = LocalReplica::open(me, pair_dir)?;
+        // The peer's root is a path on its own host.
+        let replica = LocalReplica::open_in_pair(cfg, side, pair_dir, false)?;
         Ok(Server::new(replica, peer.id, tls))
     }
 

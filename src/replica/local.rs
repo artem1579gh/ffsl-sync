@@ -31,12 +31,13 @@ use jiff::ToSpan;
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 
-use crate::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
+use crate::config::{FollowedWrite, PairConfig, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
 use crate::fs::commit::{
     self, CopyNode, Ctx, Expected, FileMeta, Quarantine, Recovered, SweepReport,
 };
+use crate::fs::layout;
 use crate::fs::root::{follow_at, path_err};
 use crate::fs::{
     FileKind, Fingerprint, PinnedFile, Recheck, RelPath, Root, StableReader, open_checked, tmpname,
@@ -94,12 +95,37 @@ const PURGE_EVERY: Duration = Duration::from_secs(3600);
 impl LocalReplica {
     /// Opens the replica `config`: its root, its capabilities (probed,
     /// logged, and required, §1) and its index under `pair_dir`
-    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Checks the root
-    /// marker (§5.1, [`ensure_root_marker`]). Then replays the journal
+    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Refuses a root
+    /// that holds `pair_dir` or lies inside it ([`layout::check`], issue #6).
+    /// Checks the root marker (§5.1, [`ensure_root_marker`]). Then replays the journal
     /// (§5.8): commits a crash interrupted are finished or undone, and
     /// quarantined old inodes are quarantined again.
     pub fn open(config: &ReplicaConfig, pair_dir: &Path) -> Result<LocalReplica> {
+        Self::open_checked(config, None, pair_dir)
+    }
+
+    /// [`LocalReplica::open`] for replica `side` (0 = A, 1 = B) of `cfg`,
+    /// which also refuses a root that overlaps the other replica's
+    /// ([`layout::check`]); `peer_here`: this process opens that one too.
+    pub fn open_in_pair(
+        cfg: &PairConfig,
+        side: usize,
+        pair_dir: &Path,
+        peer_here: bool,
+    ) -> Result<LocalReplica> {
+        let peer = Some((&cfg.replicas[1 - side], peer_here));
+        Self::open_checked(&cfg.replicas[side], peer, pair_dir)
+    }
+
+    fn open_checked(
+        config: &ReplicaConfig,
+        peer: Option<(&ReplicaConfig, bool)>,
+        pair_dir: &Path,
+    ) -> Result<LocalReplica> {
         let root = Root::open(&config.root)?;
+        // Before anything is written to the root or the state directory.
+        let peer_here = peer.is_some_and(|(_, here)| here);
+        layout::check(&root, pair_dir, peer.map(|(p, _)| p), peer_here)?;
         let caps = Caps::probe(root.fd())?;
         caps.log(root.path());
         caps.require_minimum()?;
