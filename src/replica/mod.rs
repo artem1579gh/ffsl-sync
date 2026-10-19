@@ -229,7 +229,10 @@ impl PairReplica {
                 r, peer, pair_dir,
             )?))
         } else {
-            Ok(PairReplica::Local(LocalReplica::open(r, pair_dir)?))
+            let remote_peer = cfg.replicas[1 - side].is_remote();
+            Ok(PairReplica::Local(
+                LocalReplica::open(r, pair_dir)?.remote_peer(remote_peer),
+            ))
         }
     }
 

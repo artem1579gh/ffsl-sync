@@ -118,6 +118,14 @@ pub struct ReplicaConfig {
     /// (`-L`, `-k`, `--copy-unsafe-links`; design §4.3).
     #[serde(default)]
     pub followed_write: FollowedWrite,
+    /// Whether a symlink the peer sends may lead out of this replica's root
+    /// (design §4.6, issue #4). Unset: trusted when the peer is local,
+    /// not when it is reached over the network (`serve`, or the local side
+    /// of a pair with a remote replica). An untrusted unsafe target is
+    /// written munged, so it is never followed or adopted, on a replica
+    /// that could follow it out of its root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_peer_links: Option<bool>,
     /// Keep the files this replica's syncs replace or delete in its trash
     /// (`.~fsync.trash` at the top of the root) for this many days, instead
     /// of unlinking them; 0 (the default) means no trash (T31).
@@ -160,6 +168,7 @@ impl ReplicaConfig {
             keep_dirlinks: false,
             keep_dirlinks_unsafe: false,
             followed_write: FollowedWrite::Replace,
+            trust_peer_links: None,
             trash_days: 0,
             device: None,
             remote: None,
@@ -668,10 +677,14 @@ mod tests {
         big.replicas[1].keep_dirlinks = true;
         big.replicas[1].keep_dirlinks_unsafe = true;
         big.replicas[1].followed_write = FollowedWrite::Conflict;
+        big.replicas[1].trust_peer_links = Some(true);
         big.save(state.path()).unwrap();
         assert_eq!(PairConfig::load(state.path(), "docs").unwrap(), big);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("followed_write = \"conflict\""), "{text}");
+        assert!(text.contains("trust_peer_links = true"), "{text}");
+        // Unset (the default) is left out.
+        assert_eq!(text.matches("trust_peer_links").count(), 1, "{text}");
 
         // The config and an identity per replica, pinned by the config; no
         // temp files are left behind.

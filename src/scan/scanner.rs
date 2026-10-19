@@ -15,7 +15,10 @@
 //!   must be unchanged (same inode, so same target) after its referent is
 //!   read or opened. With `-K` ([`Scanner::keep_dirlinks`]), a link adopted
 //!   earlier (or named in [`Scanner::adopt`]) is indexed as the directory it
-//!   points to while that is still the pinned directory (§4.3.1).
+//!   points to while that is still the pinned directory (§4.3.1). A link
+//!   the replica wrote munged because the peer's target would lead out of
+//!   the root (§4.6) is indexed as the plain symlink it was made for, never
+//!   followed or adopted.
 //! - **Files:** not rehashed when (ino, size, mtime, ctime) match the index and
 //!   the entry is not `racy`; otherwise hashed with a stable read (§5.2). A
 //!   file whose ctime is within the racy window of the scan start is marked
@@ -552,6 +555,27 @@ impl Walk<'_> {
         match link_unchanged(parent, name, fp)? {
             None => {}
             Some(why) => return Ok(Obs::Dirty(why)),
+        }
+        // Written munged by the replica, since it would lead out of the root
+        // (§4.6): the symlink the index has, whatever the policy. Recognised
+        // by its target, so a copy (a materialized directory) is too.
+        if !self.munge_links
+            && is_munged(&raw)
+            && let Some(Kind::Symlink { target }) = old.map(|o| &o.kind)
+            && unmunge(&raw) == *target
+        {
+            return Ok(Obs::Found(Found {
+                kind: Kind::Symlink {
+                    target: target.clone(),
+                },
+                mode: sync_mode(fp.mode),
+                mtime_ns: fp.mtime_ns,
+                local: LocalMeta {
+                    raw_target: Some(raw),
+                    ..local_of(fp)
+                },
+                dir: None,
+            }));
         }
         let target = if self.munge_links {
             if !is_munged(&raw) && old.is_none_or(|o| o.local.ino != fp.ino) {

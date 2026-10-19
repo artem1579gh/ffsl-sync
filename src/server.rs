@@ -58,9 +58,11 @@ pub struct Server {
 impl Server {
     /// Serves `replica` to the replica `peer` with the TLS config `tls`
     /// (which decides which client certificate is accepted).
+    /// The replica's peer is reached over the network, so its symlinks are
+    /// not trusted unless the config says so (design §4.6).
     pub fn new(replica: LocalReplica, peer: ReplicaId, tls: Arc<ServerConfig>) -> Server {
         Server {
-            replica,
+            replica: replica.remote_peer(true),
             peer,
             tls,
             max_version: PROTOCOL_VERSION,

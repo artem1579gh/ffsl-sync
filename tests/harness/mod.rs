@@ -30,7 +30,7 @@ use files_sync::replica::{
 use files_sync::scan::{ScanStats, Scope};
 use files_sync::server::{Server, ServerHandle};
 use files_sync::status::ReplicaStatus;
-use files_sync::symlink::{Treatment, classify, unmunge};
+use files_sync::symlink::{Treatment, classify, is_munged, unmunge};
 use files_sync::tls::Identity;
 use files_sync::watch::Hint;
 
@@ -373,6 +373,7 @@ pub struct Opts {
     pub keep_dirlinks: bool,
     pub keep_dirlinks_unsafe: bool,
     pub followed_write: FollowedWrite,
+    pub trust_peer_links: Option<bool>,
 }
 
 impl From<SymlinkPolicy> for Opts {
@@ -399,6 +400,7 @@ pub fn open_replica(
     cfg.keep_dirlinks = opts.keep_dirlinks;
     cfg.keep_dirlinks_unsafe = opts.keep_dirlinks_unsafe;
     cfg.followed_write = opts.followed_write;
+    cfg.trust_peer_links = opts.trust_peer_links;
     LocalReplica::open(&cfg, state)
         .unwrap()
         // Old inodes are unlinked by the first sweep, so
@@ -823,6 +825,8 @@ struct View<'a> {
     opts: Opts,
     /// Whether the replica adopted the link at a path (`-K`).
     adopted: &'a dyn Fn(&str) -> bool,
+    /// The target the index has for a symlink at a path.
+    indexed: &'a dyn Fn(&str) -> Option<Vec<u8>>,
 }
 
 /// The tree at `root` as it is: symlinks as symlinks, with their raw target
@@ -884,6 +888,18 @@ fn walk(
                 continue;
             };
             let opts = &view.opts;
+            // Written munged since it would lead out of the root (design
+            // §4.6): the plain symlink the index has.
+            if !opts.munge_links
+                && is_munged(&raw)
+                && (view.indexed)(&key).is_some_and(|t| t == unmunge(&raw))
+            {
+                out.insert(
+                    key,
+                    Node::Symlink(String::from_utf8(unmunge(&raw)).unwrap()),
+                );
+                continue;
+            }
             let target = if opts.munge_links { unmunge(&raw) } else { raw };
             let referent = fs::metadata(&path).ok();
             let kind = referent.as_ref().map(|m| {
@@ -1083,6 +1099,7 @@ impl Tree {
             keep_dirlinks: c.keep_dirlinks,
             keep_dirlinks_unsafe: c.keep_dirlinks_unsafe,
             followed_write: c.followed_write,
+            trust_peer_links: c.trust_peer_links,
         }
     }
 
@@ -1102,9 +1119,18 @@ impl Tree {
         let view = View {
             opts: self.opts(),
             adopted: &|p| self.adopted(p),
+            indexed: &|p| self.indexed_target(p),
         };
         walk(&self.root, "", Some(&view), &mut Vec::new(), &mut out);
         out
+    }
+
+    /// The target of the symlink the index has at `rel`.
+    pub fn indexed_target(&self, rel: &str) -> Option<Vec<u8>> {
+        match self.entry(rel)?.kind {
+            Kind::Symlink { target } => Some(target),
+            _ => None,
+        }
     }
 
     /// Whether the index has `rel` as a directory adopted by `-K`.
@@ -1123,6 +1149,7 @@ impl Tree {
                 ..self.opts()
             },
             adopted: &|p| self.adopted(p),
+            indexed: &|p| self.indexed_target(p),
         };
         walk(&self.root, "", Some(&view), &mut Vec::new(), &mut out);
         out

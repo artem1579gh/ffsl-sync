@@ -20,6 +20,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use files_sync::config::SymlinkPolicy::{self, *};
+use files_sync::fs::RelPath;
+use files_sync::symlink::is_unsafe;
 use harness::*;
 
 /// Base files' mtime (and the outside referents'): newer than [`OLD`].
@@ -141,6 +143,19 @@ fn expected(policy: SymlinkPolicy, case: Case) -> Out {
         Munged => 7,
     };
     row[i]
+}
+
+/// The target a link made at `at` with `target` on one side has on the
+/// other side's disk. In remote mode, the peer's links are not trusted: a
+/// replica that could follow them out of its root writes an unsafe target
+/// munged (design §4.6; only `-k` receives such links as links here).
+fn arrived(m: Mode, policy: SymlinkPolicy, at: &str, target: &str) -> String {
+    let follows = matches!(policy, CopyLinks | CopyUnsafeLinks | CopyDirlinks);
+    if m == Mode::Remote && follows && is_unsafe(&RelPath::new(at).unwrap(), target.as_bytes()) {
+        format!("/rsyncd-munged/{target}")
+    } else {
+        target.to_owned()
+    }
 }
 
 /// rsync's options for `policy` (on top of `-a`).
@@ -327,13 +342,16 @@ fn one_way(m: Mode, policy: SymlinkPolicy, case: Case, from: Side) {
     let report = w.pair.sync();
 
     let link = vec![(case.link().to_owned(), format!("L:{target}"))];
-    let got = received(case, expected(policy, case), case.link(), &target);
+    let arrived = arrived(m, policy, case.link(), &target);
+    let got = received(case, expected(policy, case), case.link(), &arrived);
     assert_eq!(view(w.side(from)), base_view(&link), "{ctx}: source");
     assert_eq!(view(w.side(to)), base_view(&got), "{ctx}: destination");
     assert!(report.conflicts.is_empty(), "{ctx}: {report:?}");
     w.pair.assert_converged();
 
+    // rsync's daemon munges too, but it is compared without one.
     if case.rsync_comparable(policy)
+        && arrived == target
         && let Some(c) = rsync_into_c(&w, from, rsync_opts(policy))
     {
         assert_eq!(
@@ -362,9 +380,13 @@ fn both_changed(m: Mode, policy: SymlinkPolicy, case: Case) {
         // Not synced: each side keeps its own.
         Out::Nothing => (base_view(&[link]), base_view(&[theirs])),
         // File beats symlink (§6.2): A's link becomes the conflict copy.
+        // B gets the copy from A (munged if it would lead out of B's root).
         Out::Link => {
-            let both = base_view(&[theirs, copy_of(ID_A, &link.1)]);
-            (both.clone(), both)
+            let arrived = format!("L:{}", arrived(m, policy, at, &target));
+            (
+                base_view(&[theirs.clone(), copy_of(ID_A, &link.1)]),
+                base_view(&[theirs, copy_of(ID_A, &arrived)]),
+            )
         }
         // A's copy is newer, or a directory: B's file becomes the copy. A
         // keeps its link; B gets the real thing.

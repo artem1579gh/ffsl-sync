@@ -31,7 +31,7 @@ use jiff::ToSpan;
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 
-use crate::config::{FollowedWrite, ReplicaConfig, ReplicaId};
+use crate::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
 use crate::fs::commit::{
@@ -48,7 +48,7 @@ use crate::index::{
 use crate::replica::delta::{Assembler, BlockReader, Blocks, Delta};
 use crate::replica::{ContentReader, Op, Outcome, Precondition, Replica, wire};
 use crate::scan::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
-use crate::symlink::munge;
+use crate::symlink::{is_unsafe, munge};
 use crate::watch::{Debouncer, EventSource, Followed, Hint, InotifySource, Watcher};
 
 /// A replica rooted at a local directory, with its index in the pair's
@@ -70,6 +70,22 @@ pub struct LocalReplica {
     trash: Option<Duration>,
     /// When the trash was last purged.
     purged: Option<Instant>,
+    /// The peer is reached over the network: its symlinks are not trusted
+    /// unless the config says so (design §4.6).
+    remote_peer: bool,
+}
+
+/// The on-disk target for a link with the canonical `target` that this
+/// replica makes at `rel` (relative to the root it is made in: a `-K`
+/// directory's, beneath one) for `path`: munged if `neutralize` and the
+/// target is unsafe there, so it leads nowhere and the scanner indexes it
+/// as a plain symlink (design §4.6, issue #4). `None`: as it is.
+fn neutralized(neutralize: bool, path: &RelPath, rel: &RelPath, target: &[u8]) -> Option<Vec<u8>> {
+    if !neutralize || !is_unsafe(rel, target) {
+        return None;
+    }
+    tracing::warn!(%path, target = %target.escape_ascii(), "untrusted symlink would lead out of the root: written munged, so it is never followed (see trust_peer_links)");
+    Some(munge(target))
 }
 
 /// How often [`LocalReplica::sweep_quarantine`] purges the trash.
@@ -101,6 +117,7 @@ impl LocalReplica {
             followed: 0,
             trash: config.trash_retention(),
             purged: None,
+            remote_peer: false,
         };
         if replica.trash.is_some() {
             replica.quarantine.set_trash(&replica.root)?;
@@ -125,6 +142,27 @@ impl LocalReplica {
     pub fn quarantine_grace(mut self, grace: Duration) -> Self {
         self.quarantine.set_grace(grace);
         self
+    }
+
+    /// Whether the peer is reached over the network (a served replica, or
+    /// the local side of a pair with a remote replica). Its symlinks are then
+    /// not trusted, unless `trust_peer_links` says so (design §4.6).
+    pub fn remote_peer(mut self, remote: bool) -> Self {
+        self.remote_peer = remote;
+        self
+    }
+
+    /// Whether symlinks from the peer with unsafe targets are written
+    /// munged (design §4.6): they are not trusted, and this replica could
+    /// follow or adopt them out of its root. A munging replica munges every
+    /// link anyway.
+    fn neutralizes_peer_links(&self) -> bool {
+        let c = &self.config;
+        let follows = matches!(
+            c.symlinks,
+            SymlinkPolicy::CopyLinks | SymlinkPolicy::CopyUnsafeLinks | SymlinkPolicy::CopyDirlinks
+        ) || (c.keep_dirlinks && c.keep_dirlinks_unsafe);
+        !c.trust_peer_links.unwrap_or(!self.remote_peer) && follows && !c.munge_links
     }
 
     /// Makes [`Replica::watch`] read `source` instead of watching the root
@@ -447,6 +485,7 @@ impl LocalReplica {
             tracing::debug!(%path, %link, reason, "cannot turn the followed directory into a real one");
             Ok(Some(Outcome::PreconditionFailed(cur.clone().map(wire))))
         };
+        let neutralize = self.neutralizes_peer_links();
         let disk = Disk {
             root: &self.root,
             config: &self.config,
@@ -476,12 +515,19 @@ impl LocalReplica {
                     },
                     hash: *hash,
                 },
+                // The copy lands at the followed link's place, not where
+                // the original is, so its target is judged there.
                 Kind::Symlink { target } => CopyNode::Symlink {
-                    target: ent
-                        .local
-                        .raw_target
-                        .clone()
+                    target: match &ent.local.raw_target {
+                        Some(raw) => raw.clone(),
+                        None => neutralized(
+                            neutralize,
+                            &p,
+                            &base.rel(link).join(rel.as_bytes())?,
+                            target,
+                        )
                         .unwrap_or_else(|| target.clone()),
+                    },
                 },
                 // Not synced, so not copied (rsync would skip them too).
                 Kind::Tombstone | Kind::Unmanaged(_) => continue,
@@ -603,7 +649,8 @@ impl LocalReplica {
                     let raw = if self.config.munge_links {
                         munge(&target)
                     } else {
-                        target.clone()
+                        neutralized(self.neutralizes_peer_links(), &copy, &rel, &target)
+                            .unwrap_or_else(|| target.clone())
                     };
                     match applied(commit::create_symlink(&ctx, &rel, &raw)?) {
                         Ok(fp) => {
@@ -671,6 +718,7 @@ impl LocalReplica {
     ) -> Result<Step> {
         let id = self.config.id;
         let munge_links = self.config.munge_links;
+        let neutralize = self.neutralizes_peer_links();
         let disk = Disk {
             root: &self.root,
             config: &self.config,
@@ -723,7 +771,7 @@ impl LocalReplica {
                 let raw = if munge_links {
                     munge(&target)
                 } else {
-                    target.clone()
+                    neutralized(neutralize, path, rel, &target).unwrap_or_else(|| target.clone())
                 };
                 let out = match (live, file_or_link) {
                     (None, _) => commit::create_symlink(&ctx, rel, &raw)?,
@@ -1781,6 +1829,7 @@ mod tests {
                 keep_dirlinks: false,
                 keep_dirlinks_unsafe: false,
                 followed_write: Default::default(),
+                trust_peer_links: None,
                 trash_days: 0,
                 device: None,
                 remote: None,
@@ -1929,6 +1978,7 @@ mod tests {
             keep_dirlinks: false,
             keep_dirlinks_unsafe: false,
             followed_write: Default::default(),
+            trust_peer_links: None,
             trash_days: 0,
             device: None,
             remote: None,
@@ -2673,6 +2723,71 @@ mod tests {
         assert!(fs::symlink_metadata(fx.p("l")).unwrap().is_symlink());
         assert_eq!(fx.settled_scan().changed, 0);
         assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn untrusted_peer_links_are_written_munged() {
+        let mut fx = Fx::with(SymlinkPolicy::CopyLinks, false);
+        fx.r.config.followed_write = FollowedWrite::Conflict;
+        fx.r.remote_peer = true;
+        user_file(&fx, "target", b"referent");
+        symlink("target", fx.p("l")).unwrap();
+        fx.scan();
+
+        // Kept as a conflict copy beside the followed link: munged too.
+        let e = fx.get("l");
+        let op = Op::Symlink {
+            target: b"/etc".to_vec(),
+            mtime_ns: 0,
+            vv: peer(5),
+        };
+        applied(fx.apply("l", op, Precondition::matching(&e)));
+        let copy = fs::read_dir(fx.dir.path())
+            .unwrap()
+            .map(|d| d.unwrap().file_name().into_string().unwrap())
+            .find(|n| n.starts_with("l.sync-conflict-"))
+            .unwrap();
+        assert_eq!(
+            fs::read_link(fx.p(&copy)).unwrap(),
+            Path::new("/rsyncd-munged//etc")
+        );
+        let c = fx.get(&copy);
+        assert_eq!(
+            c.kind,
+            Kind::Symlink {
+                target: b"/etc".to_vec()
+            }
+        );
+        assert_eq!(
+            c.local.raw_target.as_deref(),
+            Some(&b"/rsyncd-munged//etc"[..])
+        );
+        // Indexed as that symlink, not followed.
+        assert_eq!(fx.settled_scan().changed, 0);
+        assert_eq!(fx.get(&copy).kind, c.kind);
+
+        // A safe target is written as it is; a trusted peer's unsafe one too.
+        let op = |t: &[u8]| Op::Symlink {
+            target: t.to_vec(),
+            mtime_ns: 0,
+            vv: peer(7),
+        };
+        applied(fx.apply("s", op(b"target"), Precondition::Absent));
+        assert_eq!(fs::read_link(fx.p("s")).unwrap(), Path::new("target"));
+        fx.r.config.trust_peer_links = Some(true);
+        applied(fx.apply("t", op(b"/etc"), Precondition::Absent));
+        assert_eq!(fs::read_link(fx.p("t")).unwrap(), Path::new("/etc"));
+        // A local peer is trusted unless the config says otherwise.
+        fx.r.remote_peer = false;
+        fx.r.config.trust_peer_links = None;
+        applied(fx.apply("u", op(b"/etc"), Precondition::Absent));
+        assert_eq!(fs::read_link(fx.p("u")).unwrap(), Path::new("/etc"));
+        fx.r.config.trust_peer_links = Some(false);
+        applied(fx.apply("v", op(b"/etc"), Precondition::Absent));
+        assert_eq!(
+            fs::read_link(fx.p("v")).unwrap(),
+            Path::new("/rsyncd-munged//etc")
+        );
     }
 
     #[test]

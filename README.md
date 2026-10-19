@@ -45,6 +45,7 @@ Each replica can be configured with an rsync-equivalent symlink policy (`symlink
 | `copy-dirlinks` (`-k`) | only symlinks to directories are followed |
 | `keep_dirlinks = true` (`-K`) | a local symlink-to-directory is kept and treated as the directory |
 | `munge_links = true` | targets are stored on disk prefixed with `/rsyncd-munged/` |
+| `trust_peer_links = true/false` | whether links from the other replica may lead out of the root; by default, yes for a local pair, no over the network (an unsafe one is then written munged) |
 
 ## Requirements
 
