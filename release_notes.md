@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.7 — 2026.10.19 19:57:13
+
+Fixes [issue #6](https://github.com/artem1579gh/files_sync/issues/6): a replica root that held the pair's state directory, or overlapped the other root, was refused only by `init`, by its path, and only for local replicas. Serving a home directory with the default `~/.local/state` inside it synced the replica's private key and index to the peer, and never stopped syncing.
+
+- **Checked at every open:** `sync`, `daemon` and `serve` now refuse a root that holds the state directory or lies inside it. They compare the directories themselves, not their paths, so symlinks do not hide it.
+- **Overlapping roots:** also refused when one replica is served on the same host (the loopback setup), recognised by its root marker, and through symlinks.
+- **Reserved temp names:** the config and status files are now written through temp files with the reserved `.~fsync.` prefix.
+
 ## 0.1.6 — 2026.10.19 14:11:00
 
 Fixes [issue #5](https://github.com/artem1579gh/files_sync/issues/5): `serve` had no resource limits. Anyone who could reach its port could exhaust its threads and file descriptors before authenticating, and the peer could freeze it or make it allocate far more memory than a message's size suggests.
