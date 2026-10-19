@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.5 — 2026.10.19 12:19:18
+
+Fixes [issue #4](https://github.com/artem1579gh/files_sync/issues/4): over the network, a malicious peer could plant symlinks that made a replica following links read files outside its root (`copy-links`, `copy-unsafe-links`, `copy-dirlinks`), or write through them (`keep_dirlinks` with `keep_dirlinks_unsafe`).
+
+- **Untrusted links are munged:** a replica no longer trusts the symlinks of a peer reached over the network. On a replica that could follow or adopt a link out of its root, a peer's link whose target is absolute or leaves the tree is written with the `/rsyncd-munged/` prefix, as rsync's daemon does. It is synced as the symlink it was sent as, but never followed or adopted. Safe targets, and links in local pairs, are unchanged.
+- **New setting:** `trust_peer_links = true/false` per replica overrides the default (trusted for a local pair, untrusted over the network).
+- **Docs:** the user guide describes what an authenticated peer can and cannot do with each symlink setting.
+
 ## 0.1.4 — 2026.10.06 10:31:00
 
 Fixes [issue #3](https://github.com/artem1579gh/files_sync/issues/3): after a conflict, saving the winning file again before the sync finished could replace the new save with its own older version, without a conflict copy.
