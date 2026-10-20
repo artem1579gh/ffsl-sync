@@ -112,9 +112,10 @@ pub fn client_handshake_upto<S: Read + Write + ?Sized>(
         HelloReply::Welcome { magic, .. } | HelloReply::Refused { magic, .. } if magic != MAGIC => {
             Err(refused("not a files_sync server (bad magic)"))
         }
-        HelloReply::Refused { reason, .. } => {
-            Err(refused(format!("server refused the session: {reason}")))
-        }
+        HelloReply::Refused { reason, .. } => Err(refused(format!(
+            "server refused the session: {}",
+            crate::error::printable(&reason)
+        ))),
         HelloReply::Welcome { version, .. }
             if !(MIN_PROTOCOL_VERSION..=max_version).contains(&version) =>
         {
@@ -837,6 +838,21 @@ mod tests {
             },
         );
         assert!(reason(c.unwrap_err()).contains("bad magic"));
+        // A server's reason cannot drive the terminal (issue #7).
+        let (c, _) = handshake(
+            |c| client_handshake(c, A, B),
+            |s| {
+                read_frame::<_, Hello>(s).unwrap().unwrap();
+                let reply = HelloReply::Refused {
+                    magic: MAGIC,
+                    reason: "no\x1b[2J\x1b]0;owned\x07".into(),
+                };
+                write_frame(s, &reply).unwrap();
+            },
+        );
+        let msg = reason(c.unwrap_err());
+        assert!(!msg.contains('\x1b') && !msg.contains('\x07'), "{msg:?}");
+        assert!(msg.contains("no\\u{1b}[2J\\u{1b}]0;owned\\u{7}"), "{msg:?}");
         let (c, s) = handshake(
             |c| client_handshake(c, A, B),
             |s| read_frame::<_, Hello>(s).unwrap().map(|_| ()),
@@ -1356,5 +1372,17 @@ mod tests {
             // Passed on again, the message is not prefixed twice.
             assert_eq!(WireError::from(&back), wire);
         }
+    }
+
+    /// Issue #7: a remote error message is printed with its control
+    /// characters escaped.
+    #[test]
+    fn remote_error_messages_are_printable() {
+        let wire = WireError {
+            kind: RemoteKind::Other,
+            message: "x\x1b[2Jy\r\u{9b}".into(),
+        };
+        let e = Error::from(through_pipe(vec![wire]).remove(0));
+        assert_eq!(e.to_string(), "remote replica: x\\u{1b}[2Jy\\r\\u{9b}");
     }
 }

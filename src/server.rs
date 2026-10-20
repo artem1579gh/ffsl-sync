@@ -20,7 +20,8 @@
 //! sending or reading in the middle of a request (an upload holds the
 //! replica's lock). Each frame's decoded size is bounded by the protocol
 //! ([`crate::budget`]), and a `RecordSync` list by the replica's own
-//! tombstones.
+//! tombstones. A `RecordSync` is about the session's peer only, and the
+//! retention its tombstones get is the server's own (issue #7).
 //!
 //! Quarantined old inodes are swept after every `RecordSync` (the end of a
 //! peer's sync cycle) and when their grace period ends ([`ServerHandle::sweep`]).
@@ -43,7 +44,7 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use crate::config::{PairConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
-use crate::index::{PeerState, VersionVector};
+use crate::index::{DEFAULT_TOMBSTONE_RETENTION, PeerState, VersionVector};
 use crate::replica::proto::{
     BATCH_BYTES, CLOCK_VERSION, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request,
     Response, WireError, batches, read_frame, send_content, server_handshake_upto, write_frame,
@@ -101,6 +102,7 @@ pub struct Server {
     max_version: u32,
     status_dir: Option<PathBuf>,
     limits: Limits,
+    retention: Duration,
 }
 
 impl Server {
@@ -116,7 +118,16 @@ impl Server {
             max_version: PROTOCOL_VERSION,
             status_dir: None,
             limits: Limits::default(),
+            retention: DEFAULT_TOMBSTONE_RETENTION,
         }
+    }
+
+    /// How long the replica keeps a tombstone that both replicas hold
+    /// (design §3); the default is [`DEFAULT_TOMBSTONE_RETENTION`]. The
+    /// value a client sends with `RecordSync` is ignored.
+    pub fn tombstone_retention(mut self, retention: Duration) -> Server {
+        self.retention = retention;
+        self
     }
 
     /// Replaces the default [`Limits`].
@@ -142,13 +153,14 @@ impl Server {
 
     /// Opens replica `side` (0 = A, 1 = B) of `cfg` and its identity from
     /// `pair_dir`; accepts only the other replica's pinned certificate.
+    /// Tombstones are kept for the config's retention.
     pub fn open(cfg: &PairConfig, side: usize, pair_dir: &Path) -> Result<Server> {
         let (me, peer) = (&cfg.replicas[side], &cfg.replicas[1 - side]);
         let identity = Identity::load(pair_dir, me.id, me.device()?)?;
         let tls = identity.server_config(peer.device()?)?;
         // The peer's root is a path on its own host.
         let replica = LocalReplica::open_in_pair(cfg, side, pair_dir, false)?;
-        Ok(Server::new(replica, peer.id, tls))
+        Ok(Server::new(replica, peer.id, tls).tombstone_retention(cfg.tombstone_retention()))
     }
 
     /// Starts accepting connections on `listener`, in a thread of its own.
@@ -165,6 +177,7 @@ impl Server {
             max_version: self.max_version,
             status_dir: self.status_dir,
             limits: self.limits,
+            retention: self.retention,
             handshakes: Mutex::new(Handshakes::default()),
             addr,
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -300,6 +313,8 @@ struct Shared {
     /// Where the status report goes, if anywhere.
     status_dir: Option<PathBuf>,
     limits: Limits,
+    /// How long tombstones are kept once both replicas hold them.
+    retention: Duration,
     /// The connections in their handshake.
     handshakes: Mutex<Handshakes>,
     /// The address it listens on.
@@ -656,10 +671,20 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
             retention,
             more,
         } => {
+            // The client's word on neither its identity nor our retention
+            // (issue #7).
+            if peer != shared.peer {
+                return Err(Error::Protocol {
+                    reason: format!(
+                        "RecordSync for replica {peer}, not the peer {}",
+                        shared.peer
+                    ),
+                });
+            }
             let tombstones = record_sync_list(shared, tls, peer, retention, tombstones, more)?;
             let removed = tombstones.and_then(|tombstones| {
                 let mut replica = shared.replica();
-                let removed = replica.record_sync(peer, tombstones, retention);
+                let removed = replica.record_sync(shared.peer, tombstones, shared.retention);
                 // The end of the peer's cycle: what can be leased goes now.
                 if replica.quarantine().next_deadline().is_some() {
                     replica.sweep_quarantine();

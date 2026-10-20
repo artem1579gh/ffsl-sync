@@ -72,7 +72,11 @@ files_sync status docs
 
 # across the network: B lives on another host and is served there
 files_sync init paper --a ~/paper --b /srv/paper --b-remote server:7777
-#   copy config.toml and B's .crt/.key to the server, then on the server:
+#   copy config.toml to the server, then on the server:
+files_sync identity paper b        # makes B's key there; prints its device ID
+#   on the laptop:
+files_sync pin paper b <DEVICE-ID>
+#   on the server:
 files_sync serve paper b
 files_sync status paper            # there: the served replica's state
 #   and on this host, as usual:

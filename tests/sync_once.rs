@@ -389,10 +389,7 @@ fn tombstones_are_collected_after_the_retention_period(m: Mode) {
         }
     }
 
-    p.engine = p
-        .engine
-        .clone()
-        .tombstone_retention(std::time::Duration::ZERO);
+    p = p.tombstone_retention(std::time::Duration::ZERO);
     let r = p.sync();
     assert_eq!((r.applied, r.collected), (0, [3, 3]));
     for t in [&p.a, &p.b] {
@@ -423,10 +420,7 @@ fn concurrent_tombstones_are_collected(m: Mode) {
     p.a.write("f", "a's edit");
     p.a.rm("f");
     p.b.rm("f");
-    p.engine = p
-        .engine
-        .clone()
-        .tombstone_retention(std::time::Duration::ZERO);
+    p = p.tombstone_retention(std::time::Duration::ZERO);
     let r = p.sync();
     assert_eq!(r.collected, [1, 1]);
     assert_eq!((p.a.entry("f"), p.b.entry("f")), (None, None));

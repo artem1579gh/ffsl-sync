@@ -1,7 +1,8 @@
 //! Two processes over 127.0.0.1 (T21): `serve` runs replica B, and
 //! `sync --once` / `daemon` run replica A against it. Each side has its own
-//! state home, as two hosts would: the server's gets the config and B's
-//! identity, copied from the client's after `init`.
+//! state home, as two hosts would: the server's gets the config, copied
+//! from the client's after `init`, and makes B's identity itself, whose
+//! device ID the client pins (issue #7).
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -97,7 +98,8 @@ struct Hosts {
 }
 
 impl Hosts {
-    /// `init` on the client's host, then B's share copied to the server's.
+    /// `init` on the client's host, the config copied to the server's,
+    /// B's identity made there and pinned on the client's.
     fn new() -> Hosts {
         let t = || tempfile::tempdir().unwrap();
         let hosts = Hosts {
@@ -116,15 +118,36 @@ impl Hosts {
             &["init", "p", "--a", a, "--b", b, "--b-remote", "127.0.0.1:9"],
         );
         assert!(out.contains("served at 127.0.0.1:9"), "{out}");
-        let cfg = hosts.cfg();
+        assert!(out.contains("files_sync identity p b"), "{out}");
         let (from, to) = (
             hosts.pair_dir(hosts.client.path()),
             hosts.pair_dir(hosts.server.path()),
         );
         fs::create_dir_all(&to).unwrap();
-        let (crt, key) = Identity::paths(&from, cfg.replicas[1].id);
-        for f in [from.join(config::CONFIG_FILE), crt, key] {
-            fs::copy(&f, to.join(f.file_name().unwrap())).unwrap();
+        fs::copy(from.join(config::CONFIG_FILE), to.join(config::CONFIG_FILE)).unwrap();
+        let out = ok(hosts.server.path(), &["identity", "p", "b"]);
+        let pin = out
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("on the host that syncs the pair, pin it with: ")
+            })
+            .unwrap_or_else(|| panic!("no pin command in {out}"));
+        let args: Vec<&str> = pin.split(' ').skip(1).collect();
+        assert_eq!(args[..3], ["pin", "p", "b"], "{pin}");
+        ok(hosts.client.path(), &args);
+        // The configs agree, and each key is on its own host only.
+        let cfg = hosts.cfg();
+        assert_eq!(PairConfig::load(hosts.server.path(), "p").unwrap(), cfg);
+        for (side, here, there) in [(0, &from, &to), (1, &to, &from)] {
+            for f in <[PathBuf; 2]>::from(Identity::paths(here, cfg.replicas[side].id)) {
+                assert!(f.exists(), "{}", f.display());
+                assert!(
+                    !there.join(f.file_name().unwrap()).exists(),
+                    "{}",
+                    f.display()
+                );
+            }
         }
         Hosts {
             server_log: hosts.server.path().join("serve.log"),
@@ -233,7 +256,7 @@ fn sync_daemon_and_pinning_between_two_processes() {
     for f in <[PathBuf; 2]>::from(Identity::paths(&pair_dir, a)) {
         fs::remove_file(f).unwrap();
     }
-    let stranger = Identity::generate(a).unwrap();
+    let stranger = Identity::generate().unwrap();
     stranger.save(&pair_dir, a).unwrap();
     let mut wrong = cfg.clone();
     wrong.replicas[0].device = Some(stranger.device());
@@ -380,4 +403,70 @@ fn status_on_the_serving_host() {
     );
     assert!(st.contains("3 entries (0 tombstones)"), "{st}");
     assert!(!st.contains("served here") && !st.contains("never"), "{st}");
+}
+
+/// Issue #7: B's identity is made on its server, never by `init` on the
+/// client. Until the client pins its device ID, neither side starts, and
+/// both say what to do.
+#[test]
+fn a_served_replica_needs_its_own_identity_and_a_pin() {
+    let t = || tempfile::tempdir().unwrap();
+    let (client, server, ra, rb) = (t(), t(), t(), t());
+    let (a, b) = (ra.path().to_str().unwrap(), rb.path().to_str().unwrap());
+    ok(
+        client.path(),
+        &["init", "p", "--a", a, "--b", b, "--b-remote", "127.0.0.1:9"],
+    );
+    let err = |home: &Path, args: &[&str]| {
+        let out = run(home, args);
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let e = err(client.path(), &["sync", "--once", "p"]);
+    assert!(
+        e.contains("no pinned device id") && e.contains("files_sync identity"),
+        "{e}"
+    );
+
+    let (from, to) = (
+        config::pair_dir(client.path(), "p").unwrap(),
+        config::pair_dir(server.path(), "p").unwrap(),
+    );
+    fs::create_dir_all(&to).unwrap();
+    fs::copy(from.join(config::CONFIG_FILE), to.join(config::CONFIG_FILE)).unwrap();
+    let serve = ["serve", "p", "b", "--listen", "127.0.0.1:0"];
+    let e = err(server.path(), &serve);
+    assert!(e.contains("no pinned device id"), "{e}");
+
+    let first = ok(server.path(), &["identity", "p", "b"]);
+    assert!(first.contains("new identity"), "{first}");
+    let again = ok(server.path(), &["identity", "p", "b"]);
+    assert!(!again.contains("new identity"), "{again}");
+    let device = |out: &str| {
+        out.lines()
+            .find_map(|l| l.trim().strip_prefix("device "))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(device(&first), device(&again));
+    // A's identity is on the client: the server makes none, and the
+    // client does not pin one by hand.
+    let e = err(server.path(), &["identity", "p", "a"]);
+    assert!(e.contains("made on another host"), "{e}");
+    let e = err(client.path(), &["pin", "p", "a", &device(&first)]);
+    assert!(e.contains("is on this host"), "{e}");
+    let e = err(client.path(), &["pin", "p", "b", "xyz"]);
+    assert!(e.contains("64 hex digits"), "{e}");
+
+    let pinned = ok(client.path(), &["pin", "p", "b", &device(&first)]);
+    assert!(
+        pinned.contains(&format!("pinned device {}", device(&first))),
+        "{pinned}"
+    );
+    let pinned = ok(client.path(), &["pin", "p", "b", &device(&first)]);
+    assert!(pinned.contains("(unchanged)"), "{pinned}");
+    assert_eq!(
+        PairConfig::load(client.path(), "p").unwrap(),
+        PairConfig::load(server.path(), "p").unwrap()
+    );
 }

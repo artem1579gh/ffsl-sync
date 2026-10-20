@@ -187,11 +187,12 @@ impl From<&Error> for WireError {
 }
 
 impl From<WireError> for Error {
-    /// The error on the receiving side: [`Error::Remote`] with the same class.
+    /// The error on the receiving side: [`Error::Remote`] with the same
+    /// class, its message made [`printable`](crate::error::printable).
     fn from(e: WireError) -> Error {
         Error::Remote {
             kind: e.kind,
-            message: e.message,
+            message: crate::error::printable(&e.message),
         }
     }
 }

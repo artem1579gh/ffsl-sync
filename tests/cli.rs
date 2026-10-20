@@ -448,3 +448,30 @@ fn closed_stdout_exits_quietly() {
     assert!(stderr.contains("daemon stopped"), "{stderr}");
     assert_eq!(out.status.code(), Some(141), "{stderr}");
 }
+
+/// Issue #7: `--sandbox` is a global flag, but `init`, `identity` and `pin`
+/// do not confine themselves; they refuse it instead of ignoring it.
+#[test]
+fn sandbox_is_refused_where_it_does_not_apply() {
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (a.path().to_str().unwrap(), b.path().to_str().unwrap());
+    let out = run(
+        state.path(),
+        &["init", "--sandbox", "p", "--a", a, "--b", b],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--sandbox applies to"), "{stderr}");
+    assert!(!state.path().join("fsync").exists());
+    ok(state.path(), &["init", "p", "--a", a, "--b", b]);
+    for args in [
+        &["--sandbox", "identity", "p", "a"][..],
+        &["--sandbox", "pin", "p", "a", &"0".repeat(64)],
+    ] {
+        let out = run(state.path(), args);
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--sandbox applies to"), "{stderr}");
+    }
+}

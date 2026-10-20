@@ -214,3 +214,38 @@ impl Error {
 
 /// Library result type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// `text` with its control characters, and the bidi controls that reorder
+/// what a terminal shows, escaped as in Rust literals (`\n`, `\u{1b}`).
+/// Text that the other side of a connection sends goes through it, so that
+/// it cannot drive the terminal it is printed on (issue #7).
+pub fn printable(text: &str) -> String {
+    let unsafe_char =
+        |c: char| c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if unsafe_char(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printable_escapes_control_characters() {
+        assert_eq!(printable("plain: é ü \\ ok"), "plain: é ü \\ ok");
+        assert_eq!(
+            printable("a\x1b]0;title\x07b\r\n\u{9b}2J\u{202e}"),
+            "a\\u{1b}]0;title\\u{7}b\\r\\n\\u{9b}2J\\u{202e}"
+        );
+        // Escaping twice changes nothing more.
+        let once = printable("x\x1b[31m");
+        assert_eq!(printable(&once), once);
+    }
+}

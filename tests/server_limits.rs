@@ -2,7 +2,8 @@
 //! handshakes are bounded, a handshake has a deadline, a client stopped in
 //! the middle of an upload holds up the others only until the request
 //! timeout (and never a shutdown), and a `RecordSync` list only keeps what
-//! the server's own tombstones need.
+//! the server's own tombstones need. A `RecordSync` names the session's
+//! peer, and its retention is the server's (issue #7).
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +11,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use files_sync::config::{self, PairConfig, ReplicaId};
+use files_sync::engine::Engine;
 use files_sync::fs::RelPath;
 use files_sync::fs::commit::FileMeta;
 use files_sync::index::{PeerState, VersionVector};
@@ -314,6 +316,47 @@ fn record_sync_keeps_only_current_tombstones() {
     let batch = Request::RecordSync {
         peer: a,
         tombstones: vec![(RelPath::new("t").unwrap(), vv, PeerState::Tombstone(long))],
+        retention: Duration::ZERO,
+        more: false,
+    };
+    write_frame(&mut s, &batch).unwrap();
+    assert!(matches!(
+        read_frame::<_, Response>(&mut s),
+        Err(_) | Ok(None)
+    ));
+}
+
+/// Issue #7: the server records a sync with the session's peer only, and
+/// keeps tombstones for its own retention, whatever the client says.
+#[test]
+fn record_sync_takes_neither_peer_nor_retention_from_the_client() {
+    let fx = Fx::new(Limits::default());
+    let ra = fx.cfg.replicas[0].root.clone();
+    let mut a = LocalReplica::open(&fx.cfg.replicas[0], &fx.pair_dir).unwrap();
+    let mut b = fx.client().unwrap();
+    // A client asking for no retention at all.
+    let engine = Engine::new().tombstone_retention(Duration::ZERO);
+    std::fs::write(ra.join("f"), b"x").unwrap();
+    engine.sync_once(&mut a, &mut b).unwrap();
+    assert!(fx.rb.path().join("f").exists());
+    std::fs::remove_file(ra.join("f")).unwrap();
+    let mut collected = [0; 2];
+    for _ in 0..3 {
+        let report = engine.sync_once(&mut a, &mut b).unwrap();
+        for (sum, n) in collected.iter_mut().zip(report.collected) {
+            *sum += n;
+        }
+    }
+    // A (local) follows the engine; B keeps its tombstone for 30 days.
+    assert_eq!(collected, [1, 0]);
+    drop(b);
+
+    // A RecordSync on behalf of another replica ends the connection.
+    let mut s = fx.session();
+    let (_, b_id) = fx.ids();
+    let batch = Request::RecordSync {
+        peer: b_id,
+        tombstones: Vec::new(),
         retention: Duration::ZERO,
         more: false,
     };

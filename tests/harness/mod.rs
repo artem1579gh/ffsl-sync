@@ -118,21 +118,27 @@ impl Mode {
     ) -> TestReplica {
         match self {
             Mode::Local => TestReplica::Local(replica),
-            Mode::Remote => {
-                let (server_tls, client_tls) = loopback_tls();
-                let id = replica.id();
-                let server = Server::new(replica, peer, server_tls.clone())
-                    .max_protocol(server)
-                    .spawn(TcpListener::bind("127.0.0.1:0").unwrap())
-                    .unwrap();
-                let addr = server.local_addr().to_string();
-                let client =
-                    RemoteReplica::with_protocol(addr, peer, id, client_tls.clone(), client)
-                        .unwrap();
-                TestReplica::Remote { client, server }
-            }
+            Mode::Remote => serve(replica, peer, client, |s| s.max_protocol(server)),
         }
     }
+}
+
+/// `replica` served over loopback by a [`Server`] that `setup` adjusts,
+/// reached by a client that offers protocol versions up to `client`.
+fn serve(
+    replica: LocalReplica,
+    peer: ReplicaId,
+    client: u32,
+    setup: impl FnOnce(Server) -> Server,
+) -> TestReplica {
+    let (server_tls, client_tls) = loopback_tls();
+    let id = replica.id();
+    let server = setup(Server::new(replica, peer, server_tls.clone()))
+        .spawn(TcpListener::bind("127.0.0.1:0").unwrap())
+        .unwrap();
+    let addr = server.local_addr().to_string();
+    let client = RemoteReplica::with_protocol(addr, peer, id, client_tls.clone(), client).unwrap();
+    TestReplica::Remote { client, server }
 }
 
 type LoopbackTls = (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>);
@@ -142,8 +148,8 @@ type LoopbackTls = (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>);
 fn loopback_tls() -> &'static LoopbackTls {
     static TLS: OnceLock<LoopbackTls> = OnceLock::new();
     TLS.get_or_init(|| {
-        let server = Identity::generate(ID_A).unwrap();
-        let client = Identity::generate(ID_B).unwrap();
+        let server = Identity::generate().unwrap();
+        let client = Identity::generate().unwrap();
         (
             server.server_config(client.device()).unwrap(),
             client.client_config(server.device()).unwrap(),
@@ -540,6 +546,28 @@ impl Pair {
         Pair {
             a: map(self.a, idb),
             b: map(self.b, ida),
+            ..self
+        }
+    }
+
+    /// Sets the engine's tombstone retention, and in remote mode the
+    /// servers' too, as `serve` takes its own from the config (a server
+    /// ignores the client's, issue #7). A served replica is served anew.
+    pub fn tombstone_retention(self, retention: Duration) -> Pair {
+        let (ida, idb) = (self.a.id(), self.b.id());
+        let reserve = |t: Tree, peer| Tree {
+            replica: match t.replica {
+                TestReplica::Local(r) => TestReplica::Local(r),
+                served => serve(served.into_local(), peer, PROTOCOL_VERSION, |s| {
+                    s.tombstone_retention(retention)
+                }),
+            },
+            ..t
+        };
+        Pair {
+            a: reserve(self.a, idb),
+            b: reserve(self.b, ida),
+            engine: self.engine.clone().tombstone_retention(retention),
             ..self
         }
     }

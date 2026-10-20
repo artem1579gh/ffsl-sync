@@ -77,6 +77,7 @@ fn serve_refuses_a_root_that_holds_its_state_directory() {
         &state_home,
         &["init", "p", "--a", a, "--b", b, "--b-remote", "127.0.0.1:9"],
     );
+    ok(&state_home, &["identity", "p", "b"]);
     let out = exits(serve(&state_home));
     refused(&out, "contains the state directory");
     // Refused before anything was written to it.
@@ -154,6 +155,7 @@ fn overlapping_roots_over_loopback_are_refused() {
                 "127.0.0.1:9",
             ],
         );
+        ok(&state_home, &["identity", "p", "b"]);
         let mut server = serve(&state_home);
         let mut line = String::new();
         BufReader::new(server.stdout.as_mut().unwrap())

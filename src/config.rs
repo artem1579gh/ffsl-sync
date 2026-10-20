@@ -186,13 +186,15 @@ impl ReplicaConfig {
         self.remote.is_some()
     }
 
-    /// The pinned device ID; an error if the config has none (a pair made
+    /// The pinned device ID; an error if the config has none (a replica
+    /// served elsewhere whose identity was not pinned yet, or a pair made
     /// before T21).
     pub fn device(&self) -> Result<DeviceId> {
         self.device.ok_or_else(|| Error::Tls {
             reason: format!(
-                "replica {} has no pinned device id (a pair made before network \
-                 support; init it again)",
+                "replica {} has no pinned device id: run `files_sync identity` for it \
+                 on the host that serves it, then `files_sync pin` with the device id \
+                 it prints on the other host",
                 self.id
             ),
         })
@@ -310,6 +312,14 @@ impl PairConfig {
         Ok(path)
     }
 
+    /// [`PairConfig::save`] after the checks of [`PairConfig::load`].
+    fn save_checked(&self, state_home: &Path) -> Result<PathBuf> {
+        let path = config_path(state_home, &self.name)?;
+        self.check()
+            .map_err(|reason| Error::InvalidConfig { path, reason })?;
+        self.save(state_home)
+    }
+
     /// [`PairConfig::tombstone_retention_days`] as a duration.
     pub fn tombstone_retention(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.tombstone_retention_days.saturating_mul(SECS_PER_DAY))
@@ -387,10 +397,13 @@ pub fn init(state_home: &Path, pair: &str, a: &Path, b: &Path) -> Result<(PairCo
 
 /// Creates and saves a new pair: canonicalises the local roots, checks they
 /// are directories that neither overlap each other nor contain the state
-/// directory, and generates replica IDs and a TLS identity per replica
-/// (design §7.1), whose device IDs the config pins. A remote replica's root
-/// must be absolute and is not checked here (it lies on another host).
-/// Returns the config and its path.
+/// directory, and generates replica IDs and the TLS identities this host
+/// needs (design §7.1, [`identity_here`]), whose device IDs the config pins.
+/// A replica served elsewhere for a local peer gets its identity on its
+/// server's host ([`create_identity`]), and its device ID is pinned here
+/// later ([`pin_device`]), so its key never leaves that host (issue #7).
+/// A remote replica's root must be absolute and is not checked here (it
+/// lies on another host). Returns the config and its path.
 pub fn init_with(
     state_home: &Path,
     pair: &str,
@@ -419,19 +432,105 @@ pub fn init_with(
             rc.remote = r.remote.map(str::to_owned);
         }
     })?;
-    let identities = [
-        Identity::generate(cfg.replicas[0].id)?,
-        Identity::generate(cfg.replicas[1].id)?,
-    ];
-    for (rc, identity) in cfg.replicas.iter_mut().zip(&identities) {
-        rc.device = Some(identity.device());
+    let mut identities = [None, None];
+    for (side, identity) in identities.iter_mut().enumerate() {
+        if identity_here(&cfg, side) {
+            let new = Identity::generate()?;
+            cfg.replicas[side].device = Some(new.device());
+            *identity = Some(new);
+        }
     }
     // The config first: it refuses an existing pair before anything is written.
     let path = cfg.create(&state_home)?;
     for (rc, identity) in cfg.replicas.iter().zip(&identities) {
-        identity.save(&state_dir, rc.id)?;
+        if let Some(identity) = identity {
+            identity.save(&state_dir, rc.id)?;
+        }
     }
     Ok((cfg, path))
+}
+
+/// Whether the host that syncs `cfg` needs the identity of replica `side`:
+/// it opens the replica itself, or it connects to the other replica's
+/// server on its behalf. That is all but a remote replica with a local
+/// peer: only its server presents it.
+pub fn identity_here(cfg: &PairConfig, side: usize) -> bool {
+    !cfg.replicas[side].is_remote() || cfg.replicas[1 - side].is_remote()
+}
+
+/// Makes the TLS identity of replica `side` of `pair` in this host's state
+/// directory, unless it is there already, and pins its device ID in the
+/// config here (issue #7). Run on the host that serves a replica, so that
+/// its key never leaves it; the other host pins the device ID with
+/// [`pin_device`]. Returns the config and whether the identity is new.
+///
+/// A replica whose device ID is pinned already must have its identity
+/// here: one made on another host is never replaced.
+pub fn create_identity(state_home: &Path, pair: &str, side: usize) -> Result<(PairConfig, bool)> {
+    let mut cfg = PairConfig::load(state_home, pair)?;
+    let dir = pair_dir(state_home, pair)?;
+    let r = &cfg.replicas[side];
+    if let Some(device) = r.device {
+        Identity::load(&dir, r.id, device).map_err(|e| {
+            if e.is_not_found() {
+                Error::Tls {
+                    reason: format!(
+                        "replica {} has a pinned device id, but its identity is not in {}: \
+                         it was made on another host",
+                        r.id,
+                        dir.display()
+                    ),
+                }
+            } else {
+                e
+            }
+        })?;
+        return Ok((cfg, false));
+    }
+    // An identity without a pin is left by an interrupted run: pin it.
+    let (identity, new) = match Identity::read(&dir, r.id) {
+        Ok(identity) => (identity, false),
+        Err(e) if e.is_not_found() => {
+            let identity = Identity::generate()?;
+            identity.save(&dir, r.id)?;
+            (identity, true)
+        }
+        Err(e) => return Err(e),
+    };
+    cfg.replicas[side].device = Some(identity.device());
+    cfg.save_checked(state_home)?;
+    Ok((cfg, new))
+}
+
+/// Pins `device` as the device ID of replica `side` of `pair` in this
+/// host's config: the ID that `identity` printed on the host that serves
+/// it (issue #7). Refused if this host holds the replica's identity.
+/// Returns the config and the device ID pinned before, if any.
+pub fn pin_device(
+    state_home: &Path,
+    pair: &str,
+    side: usize,
+    device: DeviceId,
+) -> Result<(PairConfig, Option<DeviceId>)> {
+    let mut cfg = PairConfig::load(state_home, pair)?;
+    let dir = pair_dir(state_home, pair)?;
+    let r = &cfg.replicas[side];
+    let (crt, key) = Identity::paths(&dir, r.id);
+    if r.device != Some(device) && (key.exists() || crt.exists()) {
+        return Err(Error::Tls {
+            reason: format!(
+                "replica {}'s identity is on this host ({}); its device id is pinned \
+                 by `files_sync identity`, not by hand",
+                r.id,
+                key.display()
+            ),
+        });
+    }
+    let old = cfg.replicas[side].device.replace(device);
+    if old != Some(device) {
+        cfg.save_checked(state_home)?;
+    }
+    Ok((cfg, old))
 }
 
 fn remote_root(path: &Path) -> Result<PathBuf> {
@@ -727,6 +826,13 @@ mod tests {
         let text = fs::read_to_string(config_path(state.path(), "p").unwrap()).unwrap();
         assert!(text.contains("remote = \"server.example:22000\""), "{text}");
         assert!(text.contains("device = \""), "{text}");
+        // Only A's identity is made here: B's is made on its server.
+        let dir = pair_dir(state.path(), "p").unwrap();
+        assert!(cfg.replicas[0].device.is_some() && cfg.replicas[1].device.is_none());
+        let [(a_crt, a_key), (b_crt, b_key)] =
+            cfg.replicas.each_ref().map(|r| Identity::paths(&dir, r.id));
+        assert!(a_crt.exists() && a_key.exists());
+        assert!(!b_crt.exists() && !b_key.exists());
 
         // A remote root must be absolute; it may look nested in a local one
         // (it is on another host), and is never checked here.
@@ -757,6 +863,95 @@ mod tests {
         old.save(state.path()).unwrap();
         let old = PairConfig::load(state.path(), "p").unwrap();
         assert!(matches!(old.replicas[1].device(), Err(Error::Tls { .. })));
+    }
+
+    /// Issue #7: each identity is made on the host that presents it, and
+    /// only device IDs cross between the hosts.
+    #[test]
+    fn identities_are_made_where_they_are_used() {
+        let (client, server, ra) = (tempdir(), tempdir(), tempdir());
+        let remote = NewReplica {
+            root: Path::new("/srv/b"),
+            remote: Some("server.example:22000"),
+        };
+        let (cfg, path) =
+            init_with(client.path(), "p", [NewReplica::local(ra.path()), remote]).unwrap();
+        let (client_dir, server_dir) = (
+            pair_dir(client.path(), "p").unwrap(),
+            pair_dir(server.path(), "p").unwrap(),
+        );
+        // Not before B is pinned.
+        assert!(matches!(cfg.replicas[1].device(), Err(Error::Tls { .. })));
+        fs::create_dir_all(&server_dir).unwrap();
+        fs::copy(&path, server_dir.join(CONFIG_FILE)).unwrap();
+
+        let (on_server, new) = create_identity(server.path(), "p", 1).unwrap();
+        assert!(new);
+        let b = on_server.replicas[1].device.unwrap();
+        assert_eq!(PairConfig::load(server.path(), "p").unwrap(), on_server);
+        // Again: the same identity.
+        let (again, new) = create_identity(server.path(), "p", 1).unwrap();
+        assert!(!new);
+        assert_eq!(again.replicas[1].device, Some(b));
+
+        let (on_client, old) = pin_device(client.path(), "p", 1, b).unwrap();
+        assert_eq!(old, None);
+        assert_eq!(on_client, on_server);
+        assert_eq!(PairConfig::load(client.path(), "p").unwrap(), on_client);
+        // Each key is on its own host only.
+        let [(a_crt, a_key), (b_crt, b_key)] =
+            [0, 1].map(|i| Identity::paths(Path::new(""), cfg.replicas[i].id));
+        for (dir, here, elsewhere) in [
+            (&client_dir, [&a_crt, &a_key], [&b_crt, &b_key]),
+            (&server_dir, [&b_crt, &b_key], [&a_crt, &a_key]),
+        ] {
+            assert!(here.iter().all(|f| dir.join(f).exists()));
+            assert!(elsewhere.iter().all(|f| !dir.join(f).exists()));
+        }
+        Identity::load(&server_dir, cfg.replicas[1].id, b).unwrap();
+
+        // Pinning again: a no-op, or a new ID that replaces the old one.
+        assert_eq!(pin_device(client.path(), "p", 1, b).unwrap().1, Some(b));
+        let other = DeviceId::of(b"another certificate");
+        assert_eq!(pin_device(client.path(), "p", 1, other).unwrap().1, Some(b));
+        pin_device(client.path(), "p", 1, b).unwrap();
+        // Never A's own ID, and not a replica whose identity is here.
+        let a = cfg.replicas[0].device.unwrap();
+        let err = pin_device(client.path(), "p", 1, a).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfig { .. }), "{err}");
+        let err = pin_device(client.path(), "p", 0, other).unwrap_err();
+        assert!(err.to_string().contains("is on this host"), "{err}");
+        let err = pin_device(server.path(), "p", 1, other).unwrap_err();
+        assert!(err.to_string().contains("is on this host"), "{err}");
+        assert_eq!(PairConfig::load(client.path(), "p").unwrap(), on_client);
+        // A's identity was made on the client: the server never makes one.
+        let err = create_identity(server.path(), "p", 0).unwrap_err();
+        assert!(err.to_string().contains("made on another host"), "{err}");
+
+        // An identity saved by a run interrupted before the config: pinned.
+        let mut unpinned = on_server.clone();
+        unpinned.replicas[1].device = None;
+        unpinned.save(server.path()).unwrap();
+        let (back, new) = create_identity(server.path(), "p", 1).unwrap();
+        assert!(!new);
+        assert_eq!(back.replicas[1].device, Some(b));
+    }
+
+    /// With both replicas served elsewhere, this host connects to each
+    /// server on behalf of the other replica, so it needs both identities.
+    #[test]
+    fn both_remote_identities_are_made_by_init() {
+        let state = tempdir();
+        let r = |root: &'static str, addr: &'static str| NewReplica {
+            root: Path::new(root),
+            remote: Some(addr),
+        };
+        let (cfg, _) = init_with(state.path(), "p", [r("/a", "h:1"), r("/b", "h:2")]).unwrap();
+        let dir = pair_dir(state.path(), "p").unwrap();
+        for (i, rc) in cfg.replicas.iter().enumerate() {
+            assert!(identity_here(&cfg, i));
+            Identity::load(&dir, rc.id, rc.device.unwrap()).unwrap();
+        }
     }
 
     #[test]

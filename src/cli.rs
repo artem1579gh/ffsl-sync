@@ -21,7 +21,7 @@ use crate::replica::{Housekeeping, PairReplica, Replica};
 use crate::sandbox;
 use crate::server::Server;
 use crate::status::PairStatus;
-use crate::tls::Identity;
+use crate::tls::{DeviceId, Identity};
 
 /// `println!` that survives a closed stdout: see [`out`].
 macro_rules! outln {
@@ -78,7 +78,7 @@ pub const EXIT_STDOUT_CLOSED: u8 = 141;
 struct Cli {
     /// With sync, daemon, serve and status: confine the process with
     /// landlock, so it may write only beneath the pair's local replica roots
-    /// and its state directory (Linux ≥ 5.13).
+    /// and its state directory (Linux ≥ 5.13). Refused with other commands.
     #[arg(long, global = true)]
     sandbox: bool,
     #[command(subcommand)]
@@ -89,11 +89,12 @@ struct Cli {
 enum Command {
     /// Create a new sync pair between two directories.
     ///
-    /// Also generates a TLS certificate per replica (in the state directory)
-    /// and pins both device IDs in the config. For a replica on another
-    /// host, give its address with --a-remote/--b-remote, then copy the
-    /// config and that replica's .crt and .key to the same state directory
-    /// there and run `serve` for it.
+    /// Also generates a TLS certificate for each replica this host runs (in
+    /// the state directory) and pins its device ID in the config. For a
+    /// replica on another host, give its address with
+    /// --a-remote/--b-remote, then copy the config to the same state
+    /// directory there, run `identity` for that replica there, `pin` the
+    /// device ID it prints here, and run `serve` for it there.
     Init {
         /// Name of the pair; its state lives in $XDG_STATE_HOME/fsync/<PAIR>/.
         pair: String,
@@ -127,6 +128,25 @@ enum Command {
     Daemon { pair: String },
     /// Show the state of a pair.
     Status { pair: String },
+    /// Create a replica's TLS identity on this host, if it has none yet, pin
+    /// its device ID in the config here, and print it.
+    ///
+    /// Run it on the host that serves the replica, then pin the device ID
+    /// on the other host with `pin`. The private key never leaves this host.
+    Identity {
+        pair: String,
+        /// The replica.
+        side: SideArg,
+    },
+    /// Pin the device ID of a replica whose identity was made on another
+    /// host (the ID that `identity` printed there).
+    Pin {
+        pair: String,
+        /// The replica.
+        side: SideArg,
+        /// Its device ID: 64 hex digits.
+        device: DeviceId,
+    },
     /// Run one replica of a pair for its peer, over TLS (mutual, pinned
     /// certificates); stops cleanly on SIGINT or SIGTERM.
     Serve {
@@ -155,6 +175,13 @@ impl SideArg {
             SideArg::B => 1,
         }
     }
+
+    fn name(self) -> &'static str {
+        match self {
+            SideArg::A => "a",
+            SideArg::B => "b",
+        }
+    }
 }
 
 /// Parses the command line and runs the selected subcommand.
@@ -172,6 +199,14 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn run_command(cli: Cli) -> anyhow::Result<()> {
+    if cli.sandbox
+        && matches!(
+            cli.command,
+            Command::Init { .. } | Command::Identity { .. } | Command::Pin { .. }
+        )
+    {
+        bail!("--sandbox applies to sync, daemon, serve and status only");
+    }
     match cli.command {
         Command::Init {
             pair,
@@ -205,14 +240,25 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
                 if let Some(device) = r.device {
                     outln!("     device {device}");
                 }
-                if let Some(addr) = &r.remote {
+                let Some(addr) = &r.remote else { continue };
+                if r.device.is_some() {
+                    // Both are remote: this host acts for each replica.
                     let (crt, key) = Identity::paths(&pair_dir, r.id);
                     outln!(
                         "     served at {addr}: copy {}, {} and {} to {} on that host, \
-                         then run `serve {pair} {side}` there",
+                         then run `files_sync serve {pair} {side}` there",
                         path.display(),
                         crt.display(),
                         key.display(),
+                        pair_dir.display()
+                    );
+                } else {
+                    outln!(
+                        "     served at {addr}: copy {} to {} on that host, run \
+                         `files_sync identity {pair} {side}` there, pin the device ID it \
+                         prints here with `files_sync pin {pair} {side} <DEVICE-ID>`, \
+                         then run `files_sync serve {pair} {side}` there",
+                        path.display(),
                         pair_dir.display()
                     );
                 }
@@ -301,6 +347,47 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
             }
             let st = PairStatus::load(&cfg, &pair_dir)?;
             print_status(&cfg, &st);
+            Ok(())
+        }
+        Command::Identity { pair, side } => {
+            let state_home = config::state_home()?;
+            let (cfg, new) = config::create_identity(&state_home, &pair, side.index())?;
+            let r = &cfg.replicas[side.index()];
+            let device = r.device.expect("pinned by create_identity");
+            let pair_dir = config::pair_dir(&state_home, &pair)?;
+            let (_, key) = Identity::paths(&pair_dir, r.id);
+            let what = if new { "new identity" } else { "identity" };
+            outln!(
+                "replica {} of {:?} ({}): {what} in {}",
+                side.name(),
+                cfg.name,
+                r.id,
+                key.display()
+            );
+            outln!("  device {device}");
+            if r.is_remote() && !cfg.replicas[1 - side.index()].is_remote() {
+                outln!(
+                    "  on the host that syncs the pair, pin it with: files_sync pin {pair} {} {device}",
+                    side.name()
+                );
+            }
+            Ok(())
+        }
+        Command::Pin { pair, side, device } => {
+            let state_home = config::state_home()?;
+            let (cfg, old) = config::pin_device(&state_home, &pair, side.index(), device)?;
+            let r = &cfg.replicas[side.index()];
+            let was = match old {
+                Some(old) if old == device => " (unchanged)".to_owned(),
+                Some(old) => format!(" (was {old})"),
+                None => String::new(),
+            };
+            outln!(
+                "replica {} of {:?} ({}): pinned device {device}{was}",
+                side.name(),
+                cfg.name,
+                r.id
+            );
             Ok(())
         }
         Command::Serve { pair, side, listen } => {

@@ -264,7 +264,7 @@ fn wrong_certificates_are_rejected() {
     let b_device = net.cfg.replicas[1].device.unwrap();
 
     // A client whose certificate is not the pinned one.
-    let stranger = Identity::generate(a_id).unwrap();
+    let stranger = Identity::generate().unwrap();
     let err = RemoteReplica::with_tls(&addr, a_id, b_id, stranger.client_config(b_device).unwrap())
         .unwrap_err();
     assert!(err.is_disconnected(), "{err}");
