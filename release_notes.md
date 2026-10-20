@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.9 — 2026.10.20 14:42:24
+
+Fixes [issue #8](https://github.com/artem1579gh/files_sync/issues/8): after a crash, or a failed commit, recovery could leave `.~fsync.*` files behind for good.
+
+- **`keep_dirlinks` (`-K`):** a commit through a kept link to a directory is now recovered through that same link. Before, recovery looked for it from the root, gave up, and left its temp, moved-aside and quarantined files in the link's directory. A file written through an open handle in that time stayed hidden there instead of becoming a conflict copy.
+- **Renamed directories:** a commit whose directory was renamed before the restart is no longer given up on. It is recovered as soon as a scan finds the directory under its new name. It is dropped only once a complete scan shows the directory is gone from the tree.
+- Journals written by older versions are still read.
+
 ## 0.1.8 — 2026.10.20 14:15:54
 
 Fixes [issue #7](https://github.com/artem1579gh/files_sync/issues/7): `init --b-remote` wrote the server's private key on the client, and the guide had it copied to the server (copying the whole state directory also put the client's key there). Also fixes four smaller network issues.
