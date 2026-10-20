@@ -2,6 +2,13 @@
 
 All times are UTC.
 
+## 0.1.10 — 2026.10.20 16:19:03
+
+Fixes [issue #9](https://github.com/artem1579gh/files_sync/issues/9): with `copy-links` (`-L`) and the default `followed_write = "replace"`, a change from the other side beneath a followed directory link could delete files on the other side.
+
+- **What happened:** the link is turned into a real copy of the directory before the change is applied. What is not synced in it (a dangling link, a link loop, a FIFO) is left out of the copy, and was then recorded as deleted, so the next sync deleted the other side's copies of those paths. For a loop where a directory used to be, that was the whole subtree.
+- **Now:** those paths count as never seen on this side, so the other side's files are copied into the new directory instead. What the link pointed to is not touched.
+
 ## 0.1.9 — 2026.10.20 14:42:24
 
 Fixes [issue #8](https://github.com/artem1579gh/files_sync/issues/8): after a crash, or a failed commit, recovery could leave `.~fsync.*` files behind for good.
