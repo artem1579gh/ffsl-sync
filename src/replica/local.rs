@@ -20,7 +20,7 @@
 //!
 //! [`LocalReplica::open`] replays the intents a crash left behind (§5.8).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
@@ -74,6 +74,9 @@ pub struct LocalReplica {
     /// The peer is reached over the network: its symlinks are not trusted
     /// unless the config says so (design §4.6).
     remote_peer: bool,
+    /// Journal intents whose directory was not found when they were
+    /// replayed: kept, and tried again after scans (issue #8).
+    orphans: BTreeSet<IntentId>,
 }
 
 /// The on-disk target for a link with the canonical `target` that this
@@ -144,6 +147,7 @@ impl LocalReplica {
             trash: config.trash_retention(),
             purged: None,
             remote_peer: false,
+            orphans: BTreeSet::new(),
         };
         if replica.trash.is_some() {
             replica.quarantine.set_trash(&replica.root)?;
@@ -256,9 +260,12 @@ impl LocalReplica {
 
     /// Replays the intents `ids` (§5.8), reading those given without one
     /// from the journal, then finishes them: done, or kept while their old
-    /// inode is quarantined. An intent that cannot be replayed (an I/O error)
-    /// is kept for the next time.
-    fn replay(&mut self, mut ids: Vec<(IntentId, Option<Intent>)>) -> Result<()> {
+    /// inode is quarantined. Each is replayed where its target is now
+    /// ([`LocalReplica::locate`]). One whose directory is not found is kept
+    /// as it is, and tried again after scans ([`LocalReplica::retry_orphans`],
+    /// issue #8); one that cannot be replayed (an I/O error) is kept for the
+    /// next start. Returns the replica paths of the directories replayed in.
+    fn replay(&mut self, mut ids: Vec<(IntentId, Option<Intent>)>) -> Result<Vec<RelPath>> {
         if ids.iter().any(|(_, i)| i.is_none()) {
             let pending = self.index.journal().pending()?;
             for (id, intent) in &mut ids {
@@ -270,32 +277,152 @@ impl LocalReplica {
                 }
             }
         }
-        let top = RelPath::root();
-        let ctx = Ctx {
-            root: &self.root,
-            base: &top,
-            caps: &self.caps,
-            replica: self.config.id,
-            journal: self.index.journal(),
-        };
-        let (mut done, mut kept) = (Vec::new(), Vec::new());
+        let snap = self.index.read()?;
+        let (mut done, mut kept, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
         for (id, intent) in ids {
-            if let Some(intent) = intent {
-                match commit::recover(&ctx, &mut self.quarantine, id, &intent) {
-                    Ok(rep) => log_recovered(&intent, &rep),
+            if let Some(intent) = intent.filter(|_| !self.quarantine.holds(id)) {
+                match self.replay_one(&snap, id, &intent) {
+                    Ok(Some(dir)) => dirs.push(dir),
+                    Ok(None) => {
+                        if self.orphans.insert(id) {
+                            tracing::warn!(path = %intent.path, "cannot replay intent: its directory is not found; its reserved names are left alone until a scan finds it");
+                        }
+                        continue;
+                    }
                     Err(e) => {
                         tracing::warn!(path = %intent.path, error = %e, "cannot replay intent; retrying at the next start");
                         continue;
                     }
                 }
             }
+            self.orphans.remove(&id);
             if self.quarantine.holds(id) {
                 kept.push(id);
             } else {
                 done.push(id);
             }
         }
-        ctx.journal.finish(&done, &kept)
+        self.index.journal().finish(&done, &kept)?;
+        Ok(dirs)
+    }
+
+    /// Replays `intent` where [`LocalReplica::locate`] finds its target, through
+    /// the same route as the commit (issue #8). Returns the replica path of
+    /// the directory, or `None` if it is not found.
+    fn replay_one(
+        &mut self,
+        snap: &ReadTxn,
+        id: IntentId,
+        intent: &Intent,
+    ) -> Result<Option<RelPath>> {
+        let Some((base, at)) = self.locate(snap, intent)? else {
+            return Ok(None);
+        };
+        let ctx = Ctx {
+            root: base.root(&self.root),
+            base: &base.link,
+            caps: &self.caps,
+            replica: self.config.id,
+            journal: self.index.journal(),
+        };
+        let rep = commit::recover(&ctx, &mut self.quarantine, id, intent, &at)?;
+        if rep.skipped.is_some() {
+            // Moved again in between.
+            return Ok(None);
+        }
+        if rep != Recovered::default() {
+            tracing::info!(path = %intent.path, op = ?intent.op, ?rep, "replayed intent");
+        }
+        base.full(&at.parent().unwrap_or_default()).map(Some)
+    }
+
+    /// Where the target of `intent` is now, as a base and a path relative
+    /// to it: its recorded place, reached the way the commit reached it
+    /// (from the root, or through its `-K` link), if its parent is still the
+    /// recorded directory there. Else beneath an indexed directory with that
+    /// directory's identity: it was moved since, or the intent was recorded
+    /// without its `-K` base ([`Intent::base`]).
+    fn locate(&self, snap: &ReadTxn, intent: &Intent) -> Result<Option<(Base, RelPath)>> {
+        let Some(name) = intent.path.name() else {
+            return Ok(None);
+        };
+        let disk = self.disk();
+        let found = |base: Base, full: &RelPath| -> Result<Option<(Base, RelPath)>> {
+            let at = base.rel(full);
+            match base.root(&self.root).resolve_parent(&at) {
+                Ok((parent, _))
+                    if Fingerprint::of_fd(parent.as_fd())?.same_file(&intent.parent) =>
+                {
+                    Ok(Some((base, at)))
+                }
+                Ok(_) => Ok(None),
+                Err(e) if e.is_unstable() || e.is_not_found() => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let recorded = if intent.base.is_root() {
+            Some(Base::top())
+        } else {
+            match disk.route(snap, &intent.path, false)? {
+                Route::At(base) if base.link == intent.base => Some(base),
+                _ => None,
+            }
+        };
+        if let Some(base) = recorded
+            && let Some(found) = found(base, &intent.path)?
+        {
+            return Ok(Some(found));
+        }
+        let p = &intent.parent;
+        for (dir, e) in snap.iter_prefix(&RelPath::root())? {
+            if e.kind != Kind::Dir || (e.local.dev, e.local.ino) != (p.dev, p.ino) {
+                continue;
+            }
+            let full = dir.join(name)?;
+            if let Route::At(base) = disk.route(snap, &full, false)?
+                && let Some(found) = found(base, &full)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// After a scan, retries the intents whose directory was not found
+    /// (issue #8), if the scan may have found it (it changed something) or
+    /// shows that it is gone: a full scan without dirty paths or errors
+    /// indexes every directory in the tree. Those still not found then are
+    /// forgotten, since their directory, and their names with it, left the
+    /// tree. The directories they are replayed in are rescanned, as replay
+    /// may put a user object back at its name.
+    fn retry_orphans(&mut self, scope: &Scope, stats: &mut ScanStats) -> Result<()> {
+        let complete =
+            matches!(scope, Scope::Full) && stats.dirty.is_empty() && stats.errors.is_empty();
+        if self.orphans.is_empty() || (stats.changed == 0 && !complete) {
+            return Ok(());
+        }
+        let dirs = self.replay(self.orphans.iter().map(|&id| (id, None)).collect())?;
+        if complete && !self.orphans.is_empty() {
+            let gone = std::mem::take(&mut self.orphans);
+            for (id, intent) in self.index.journal().pending()? {
+                if gone.contains(&id) {
+                    tracing::warn!(path = %intent.path, "forgetting an intent whose directory is no longer in the tree");
+                }
+            }
+            self.index
+                .journal()
+                .forget(&gone.into_iter().collect::<Vec<_>>())?;
+        }
+        if !dirs.is_empty() {
+            let more = self.scanner().scan(&Scope::Paths(dirs))?;
+            stats.scanned += more.scanned;
+            stats.hashed += more.hashed;
+            stats.changed += more.changed;
+            stats.tombstoned += more.tombstoned;
+            stats.dirty.extend(more.dirty);
+            stats.errors.extend(more.errors);
+        }
+        Ok(())
     }
 
     /// After a scan that changed something (a new, retargeted or removed
@@ -373,7 +500,9 @@ impl LocalReplica {
     fn settle(&mut self, failed: bool) -> Result<()> {
         let open = self.index.journal().take_open();
         if failed {
-            return self.replay(open.into_iter().map(|id| (id, None)).collect());
+            return self
+                .replay(open.into_iter().map(|id| (id, None)).collect())
+                .map(drop);
         }
         let (kept, done): (Vec<_>, Vec<_>) =
             open.into_iter().partition(|id| self.quarantine.holds(*id));
@@ -1057,7 +1186,8 @@ impl Replica for LocalReplica {
         // Before and after: a root removed during the scan (`rm -rf`, the
         // marker with it) fails the cycle before its deletions propagate.
         check_root_marker(&self.root, self.config.id)?;
-        let stats = self.scanner().scan(&scope)?;
+        let mut stats = self.scanner().scan(&scope)?;
+        self.retry_orphans(&scope, &mut stats)?;
         check_root_marker(&self.root, self.config.id)?;
         self.after_scan(&stats);
         Ok(stats)
@@ -1719,14 +1849,6 @@ fn ensure_root_marker(root: &Root, index: &IndexStore, replica: ReplicaId) -> Re
     index.set_root_marked()?;
     tracing::info!(root = %root.path().display(), "created the root marker");
     Ok(())
-}
-
-fn log_recovered(intent: &Intent, rep: &Recovered) {
-    if let Some(why) = rep.skipped {
-        tracing::warn!(path = %intent.path, why, "cannot replay intent; its reserved names are left alone");
-    } else if *rep != Recovered::default() {
-        tracing::info!(path = %intent.path, op = ?intent.op, ?rep, "replayed intent");
-    }
 }
 
 /// For a streaming read of a followed link's referent: the link must still
@@ -2968,6 +3090,7 @@ mod tests {
                     expected: None,
                     staged: None,
                     state: IntentState::Started,
+                    base: RelPath::root(),
                 })
                 .unwrap();
         }
@@ -2982,6 +3105,133 @@ mod tests {
         assert!(pending(&fx).is_empty());
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"two");
         assert!(fx.leftovers().is_empty());
+    }
+
+    /// Closes the replica, records `intents` in its journal as a crash
+    /// would have left them, and opens it again, which replays them.
+    fn reopen_with(fx: &mut Fx, intents: &[Intent]) {
+        let cfg = fx.r.config().clone();
+        let parked = tempfile::tempdir().unwrap();
+        drop(std::mem::replace(
+            &mut fx.r,
+            LocalReplica::open(&cfg, parked.path()).unwrap(),
+        ));
+        let index = IndexStore::open(&IndexStore::path_for(fx._state.path(), ME), ME).unwrap();
+        for i in intents {
+            index.journal().begin(i).unwrap();
+        }
+        drop(index);
+        fx.r = LocalReplica::open(&cfg, fx._state.path())
+            .unwrap()
+            .racy_window(RACY)
+            .quarantine_grace(Duration::ZERO);
+    }
+
+    fn pending(fx: &Fx) -> Vec<(IntentId, Intent)> {
+        fx.r.index().journal().pending().unwrap()
+    }
+
+    /// Moves `rel` aside to the reserved name `tmp`, as a delete or rename
+    /// does before it finishes; returns its fingerprint.
+    fn move_aside(fx: &Fx, rel: &str, tmp: &[u8]) -> Fingerprint {
+        let fp = fx.r.root().stat(&rp(rel)).unwrap();
+        let to = fx.p(rel).with_file_name(std::ffi::OsStr::from_bytes(tmp));
+        fs::rename(fx.p(rel), to).unwrap();
+        fp
+    }
+
+    /// Issue #8: the intents of commits through a `-K` link are replayed
+    /// through it, and one recorded without its base (before the fix) is
+    /// found by its directory's identity. Both deletes are rolled forward.
+    #[test]
+    fn replay_goes_through_keep_dirlinks_links() {
+        use crate::fs::tmpname::{TmpId, TmpKind};
+        use crate::index::{IntentOp, IntentState};
+        let mut fx = Fx::new();
+        fx.r.config.keep_dirlinks = true;
+        fs::create_dir(fx.p("real")).unwrap();
+        user_file(&fx, "real/f", b"f");
+        user_file(&fx, "real/g", b"g");
+        symlink("real", fx.p("k")).unwrap();
+        fx.scan();
+        assert!(fx.r.adopt(&rp("k")).unwrap());
+        let real = fx.r.root().stat(&rp("real")).unwrap();
+        let intents: Vec<Intent> = [("f", "k/f", "k", 1), ("g", "g", "", 2)]
+            .into_iter()
+            .map(|(name, path, base, id)| {
+                let tmp = tmpname::name(TmpKind::Del, TmpId(id));
+                let fp = move_aside(&fx, &format!("real/{name}"), &tmp);
+                Intent {
+                    op: IntentOp::Delete,
+                    path: rp(path),
+                    parent: real,
+                    tmp,
+                    old: Some(tmpname::old(TmpId(id))),
+                    expected: Some(fp.into()),
+                    staged: None,
+                    state: IntentState::Exchanged,
+                    base: rp(base),
+                }
+            })
+            .collect();
+        reopen_with(&mut fx, &intents);
+        assert_eq!(fx.r.quarantine().len(), 2);
+        let report = fx.r.sweep_quarantine();
+        assert_eq!((report.removed, report.finished.len()), (2, 2));
+        assert!(pending(&fx).is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// Issue #8: an intent whose directory was moved before the restart is
+    /// kept until a scan finds the directory, then replayed there (and the
+    /// object it puts back is indexed); one whose directory is gone is
+    /// forgotten after a complete scan.
+    #[test]
+    fn intents_wait_for_their_moved_directory() {
+        use crate::fs::tmpname::{TmpId, TmpKind};
+        use crate::index::{IntentOp, IntentState};
+        let mut fx = Fx::new();
+        fs::create_dir(fx.p("d")).unwrap();
+        user_file(&fx, "d/f", b"f");
+        fs::create_dir(fx.p("gone")).unwrap();
+        fx.scan();
+        // A rename to a conflict name that crashed after the move-aside.
+        let tmp = tmpname::name(TmpKind::Temp, TmpId(1));
+        let moved = Intent {
+            op: IntentOp::Rename,
+            path: rp("d/f"),
+            parent: fx.r.root().stat(&rp("d")).unwrap(),
+            expected: Some(move_aside(&fx, "d/f", &tmp).into()),
+            tmp,
+            old: None,
+            staged: None,
+            state: IntentState::Exchanged,
+            base: RelPath::root(),
+        };
+        // A create that crashed before it staged anything.
+        let gone = Intent {
+            op: IntentOp::Create,
+            path: rp("gone/x"),
+            parent: fx.r.root().stat(&rp("gone")).unwrap(),
+            tmp: tmpname::name(TmpKind::Temp, TmpId(2)),
+            old: None,
+            expected: None,
+            staged: None,
+            state: IntentState::Started,
+            base: RelPath::root(),
+        };
+        fs::rename(fx.p("d"), fx.p("e")).unwrap();
+        fs::remove_dir(fx.p("gone")).unwrap();
+        reopen_with(&mut fx, &[moved, gone]);
+        assert_eq!(pending(&fx).len(), 2, "kept");
+        assert_eq!(fx.leftovers().len(), 1);
+
+        fx.scan();
+        assert!(pending(&fx).is_empty());
+        assert!(fx.leftovers().is_empty());
+        assert_eq!(fs::read(fx.p("e/f")).unwrap(), b"f");
+        assert!(matches!(fx.get("e/f").kind, Kind::File { .. }));
+        assert_eq!(fx.settled_scan().changed, 0);
     }
 
     #[test]

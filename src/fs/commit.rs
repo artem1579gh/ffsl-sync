@@ -154,7 +154,7 @@ pub fn create_file(
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let mut rec = Record::new(ctx, IntentOp::Create, &t, None)?;
     let staged = match stage_file(&t, ctx.caps, &mut rec, content, meta, expected_hash)? {
         Ok(staged) => staged,
         Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
@@ -169,7 +169,7 @@ pub fn create_symlink(ctx: &Ctx<'_>, path: &RelPath, target: &[u8]) -> Result<Ou
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let mut rec = Record::new(ctx, IntentOp::Create, &t, None)?;
     let staged = stage_symlink(&t, &mut rec, target)?;
     commit_create(&t, staged)
 }
@@ -185,7 +185,7 @@ pub fn mkdir(ctx: &Ctx<'_>, path: &RelPath, mode: u32) -> Result<Outcome> {
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let mut rec = Record::new(ctx, IntentOp::Create, &t, None)?;
     let staged = stage_dir(&t, &mut rec, mode)?;
     commit_create(&t, staged)
 }
@@ -206,7 +206,7 @@ pub fn replace_file(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Replace, &t, Some(expected))?;
+    let mut rec = Record::new(ctx, IntentOp::Replace, &t, Some(expected))?;
     let staged = match stage_file(&t, ctx.caps, &mut rec, content, meta, expected_hash)? {
         Ok(staged) => staged,
         Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
@@ -227,7 +227,7 @@ pub fn replace_symlink(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Replace, &t, Some(expected))?;
+    let mut rec = Record::new(ctx, IntentOp::Replace, &t, Some(expected))?;
     let staged = stage_symlink(&t, &mut rec, target)?;
     commit_replace(ctx, quarantine, &t, staged, expected, &mut rec)
 }
@@ -249,7 +249,7 @@ pub fn delete(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Delete, &t, Some(expected))?;
+    let mut rec = Record::new(ctx, IntentOp::Delete, &t, Some(expected))?;
     commit_delete(ctx, quarantine, &t, expected, &mut rec)
 }
 
@@ -327,7 +327,7 @@ pub fn rename_to(
     if t.stat(to_name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("new name exists"));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Rename, &t, Some(expected))?;
+    let mut rec = Record::new(ctx, IntentOp::Rename, &t, Some(expected))?;
     commit_rename(ctx, &t, expected, to_name, &mut rec)
 }
 
@@ -417,7 +417,7 @@ pub fn materialize(
     if let Some(reason) = precheck(&t, link)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let mut rec = Record::new(ctx.journal, IntentOp::Materialize, &t, Some(link))?;
+    let mut rec = Record::new(ctx, IntentOp::Materialize, &t, Some(link))?;
     // Writable while it is filled; `mode` is set at the end.
     let mut staged = stage_dir(&t, &mut rec, 0o700)?;
     staged.tree = true;
@@ -756,7 +756,7 @@ struct Record<'j> {
 
 impl<'j> Record<'j> {
     fn new(
-        journal: &'j Journal,
+        ctx: &Ctx<'j>,
         op: IntentOp,
         t: &Target<'_>,
         expected: Option<&Expected>,
@@ -773,17 +773,18 @@ impl<'j> Record<'j> {
             IntentOp::Create | IntentOp::Rename => None,
         };
         Ok(Record {
-            journal,
+            journal: ctx.journal,
             id: None,
             intent: Intent {
                 op,
-                path: t.path.clone(),
+                path: replica_path(ctx.base, t.path)?,
                 parent: t.parent_fp,
                 tmp,
                 old,
                 expected: expected.copied(),
                 staged: None,
                 state: IntentState::Started,
+                base: ctx.base.clone(),
             },
         })
     }
@@ -1701,8 +1702,9 @@ pub struct Recovered {
     pub conflicts: Vec<RelPath>,
     /// Foreign objects found at the intent's reserved names, left alone.
     pub foreign: usize,
-    /// Why the intent was not replayed: its directory was moved, removed or
-    /// replaced, so its names are out of reach. Nothing was touched.
+    /// Why the intent was not replayed: its directory is not at the place
+    /// given (moved, removed or replaced), so its names are out of reach
+    /// there. Nothing was touched; the intent is not done.
     pub skipped: Option<&'static str>,
 }
 
@@ -1723,8 +1725,14 @@ pub struct Recovered {
 /// - O at the quarantine name is quarantined again, with a fresh grace
 ///   period (whoever wrote to it may still hold an fd).
 ///
+/// The names are looked for at `at`, relative to `ctx.root`: where the
+/// intent's target is now. The caller finds it (the recorded `path` and
+/// `base`, or wherever its parent directory moved since); if `at`'s parent
+/// is not the recorded one, the intent is [skipped](Recovered::skipped).
+///
 /// Replaying is idempotent: an intent that already finished finds its names
-/// empty. Afterwards the intent is done unless `quarantine` [holds] it.
+/// empty. Afterwards the intent is done unless `quarantine` [holds] it, or
+/// it was skipped.
 ///
 /// [holds]: Quarantine::holds
 pub fn recover(
@@ -1732,13 +1740,14 @@ pub fn recover(
     quarantine: &mut Quarantine,
     id: IntentId,
     intent: &Intent,
+    at: &RelPath,
 ) -> Result<Recovered> {
     let mut rep = Recovered::default();
     if quarantine.holds(id) {
         // The commit got as far as quarantining; nothing else is left.
         return Ok(rep);
     }
-    let t = match Target::open(ctx.root, &intent.path) {
+    let t = match Target::open(ctx.root, at) {
         Ok(t) if t.parent_fp.same_file(&intent.parent) => t,
         Ok(_) => {
             rep.skipped = Some("directory replaced");
@@ -2246,8 +2255,8 @@ impl Pending {
     }
 }
 
-/// The replica path of `dir`, a directory path relative to the commit's
-/// root, whose replica path is `base`.
+/// The replica path of `dir`, a path relative to the commit's root, whose
+/// replica path is `base`.
 fn replica_path(base: &RelPath, dir: &RelPath) -> Result<RelPath> {
     if dir.is_root() {
         Ok(base.clone())
@@ -3999,6 +4008,7 @@ mod tests {
             expected,
             staged,
             state: IntentState::Exchanged,
+            base: RelPath::root(),
         }
     }
 
@@ -4007,7 +4017,7 @@ mod tests {
     }
 
     fn recov(fx: &Fx, q: &mut Quarantine, i: &Intent) -> Recovered {
-        recover(&fx.ctx(), q, 7, i).unwrap()
+        recover(&fx.ctx(), q, 7, i, &i.path).unwrap()
     }
 
     use std::os::unix::ffi::OsStrExt;

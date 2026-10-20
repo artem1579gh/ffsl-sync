@@ -73,10 +73,10 @@ pub enum IntentState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Intent {
     pub op: IntentOp,
-    /// The commit's target path.
+    /// The commit's target, as a replica path.
     pub path: RelPath,
     /// The target's parent directory at resolution; replay only works in
-    /// that same directory.
+    /// that same directory (wherever it is now).
     pub parent: Fingerprint,
     /// The staging or move-aside name (see [`IntentOp`]).
     pub tmp: Vec<u8>,
@@ -87,6 +87,43 @@ pub struct Intent {
     /// The staged object N, once it is known.
     pub staged: Option<Fingerprint>,
     pub state: IntentState,
+    /// The replica path of the directory the commit resolved `path` from:
+    /// the root, or a directory link written through (`-K`, design
+    /// §4.3.1). Replay goes the same way (issue #8). Last, so a record
+    /// without it is told apart ([`LegacyIntent`]).
+    pub base: RelPath,
+}
+
+/// An intent as recorded before `base` (0.1.8 and earlier): its `path` is
+/// relative to the directory the commit resolved it from, the root or a
+/// `-K` link's, which it does not say. Read with `base` = the root; replay
+/// finds a `-K` one's directory by its identity, like a moved one.
+#[derive(Deserialize)]
+struct LegacyIntent {
+    op: IntentOp,
+    path: RelPath,
+    parent: Fingerprint,
+    tmp: Vec<u8>,
+    old: Option<Vec<u8>>,
+    expected: Option<Expected>,
+    staged: Option<Fingerprint>,
+    state: IntentState,
+}
+
+impl From<LegacyIntent> for Intent {
+    fn from(i: LegacyIntent) -> Intent {
+        Intent {
+            op: i.op,
+            path: i.path,
+            parent: i.parent,
+            tmp: i.tmp,
+            old: i.old,
+            expected: i.expected,
+            staged: i.staged,
+            state: i.state,
+            base: RelPath::root(),
+        }
+    }
 }
 
 fn dberr(e: impl Into<redb::Error>) -> Error {
@@ -100,9 +137,16 @@ fn encode(intent: &Intent) -> Result<Vec<u8>> {
 }
 
 fn decode(id: IntentId, value: &[u8]) -> Result<Intent> {
-    postcard::from_bytes(value).map_err(|e| Error::BadIndex {
-        reason: format!("intent {id}: {e}"),
-    })
+    // A legacy record ends where `base` would start.
+    postcard::from_bytes(value)
+        .or_else(|e| {
+            postcard::from_bytes::<LegacyIntent>(value)
+                .map(Intent::from)
+                .map_err(|_| e)
+        })
+        .map_err(|e| Error::BadIndex {
+            reason: format!("intent {id}: {e}"),
+        })
 }
 
 /// The `intents` table of one index database.
@@ -276,6 +320,7 @@ mod tests {
             }),
             staged: None,
             state: IntentState::Started,
+            base: RelPath::new("d").unwrap(),
         }
     }
 
@@ -303,5 +348,47 @@ mod tests {
         assert_eq!(all[0].1.state, IntentState::Quarantined);
         j.forget(&[a, c, 99]).unwrap();
         assert!(j.pending().unwrap().is_empty());
+    }
+
+    /// A record from before `base` (issue #8) still reads, with the root
+    /// as its base; a truncated record does not.
+    #[test]
+    fn legacy_records_are_read() {
+        #[derive(Serialize)]
+        struct Legacy {
+            op: IntentOp,
+            path: RelPath,
+            parent: Fingerprint,
+            tmp: Vec<u8>,
+            old: Option<Vec<u8>>,
+            expected: Option<Expected>,
+            staged: Option<Fingerprint>,
+            state: IntentState,
+        }
+        let i = intent(IntentOp::Replace);
+        let old = postcard::to_stdvec(&Legacy {
+            op: i.op,
+            path: i.path.clone(),
+            parent: i.parent,
+            tmp: i.tmp.clone(),
+            old: i.old.clone(),
+            expected: i.expected,
+            staged: Some(fp(9)),
+            state: IntentState::Exchanged,
+        })
+        .unwrap();
+        let read = decode(1, &old).unwrap();
+        assert_eq!(
+            read,
+            Intent {
+                staged: Some(fp(9)),
+                state: IntentState::Exchanged,
+                base: RelPath::root(),
+                ..i.clone()
+            }
+        );
+        let new = encode(&i).unwrap();
+        assert_eq!(decode(2, &new).unwrap(), i);
+        assert!(decode(3, &old[..old.len() - 1]).is_err());
     }
 }

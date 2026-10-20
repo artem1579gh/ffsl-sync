@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use files_sync::config::SymlinkPolicy;
 use files_sync::fs::{hooks, is_reserved, is_root_marker};
 use files_sync::index::IndexStore;
-use harness::{ID_A, ID_B, Node, Pair};
+use harness::{ID_A, ID_B, Node, Opts, Pair};
 
 /// Tells the test binary it runs as a crash child, and what to do.
 const CHILD_ENV: &str = "FSYNC_CRASH_CHILD";
@@ -64,8 +64,11 @@ struct Scenario {
     name: &'static str,
     /// Both replicas' symlink policy.
     policy: SymlinkPolicy,
+    /// B keeps its links to directories (`-K`), and A's changes beneath
+    /// them are written through.
+    keep: bool,
     /// User edits synced before the crashing cycle.
-    base: fn(&Pair),
+    base: fn(&mut Pair),
     /// The user edits the crashing cycle syncs.
     change: fn(&Pair),
     /// Whether it stages files, so it also runs with named temp files.
@@ -77,6 +80,7 @@ struct Scenario {
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "create_file",
         base: |p| p.a.mkdir("d"),
         change: |p| p.a.write_at("d/f", "new file", T1),
@@ -85,6 +89,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "replace_file",
         base: |p| p.a.write_at("f", "old content", T0),
         change: |p| p.a.write_at("f", "new content", T1),
@@ -93,6 +98,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "create_symlink",
         base: |_| {},
         change: |p| p.a.symlink("l", "some/target"),
@@ -101,6 +107,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "replace_symlink",
         base: |p| p.a.symlink("l", "old-target"),
         change: |p| p.a.symlink("l", "new-target"),
@@ -109,6 +116,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "file_to_symlink",
         base: |p| p.a.write_at("f", "a file", T0),
         change: |p| p.a.symlink("f", "now-a-link"),
@@ -117,6 +125,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "symlink_to_file",
         base: |p| p.a.symlink("f", "a-link"),
         change: |p| p.a.write_at("f", "now a file", T1),
@@ -125,6 +134,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "mkdir_with_child",
         base: |_| {},
         change: |p| p.a.write_at("d/e/f", "nested", T1),
@@ -133,6 +143,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "delete_file",
         base: |p| p.a.write_at("f", "doomed", T0),
         change: |p| p.a.rm("f"),
@@ -141,6 +152,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "delete_symlink",
         base: |p| p.a.symlink("l", "t"),
         change: |p| p.a.rm("l"),
@@ -149,6 +161,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "delete_tree",
         base: |p| {
             p.a.write_at("d/f", "f", T0);
@@ -161,6 +174,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "conflict",
         base: |p| p.a.write_at("f.txt", "base", T0),
         change: |p| {
@@ -172,6 +186,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "chmod_file",
         base: |p| {
             p.a.write_at("f", "same content", T0);
@@ -183,6 +198,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "chmod_dir",
         base: |p| {
             p.a.mkdir("d");
@@ -194,6 +210,7 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         policy: SymlinkPolicy::Links,
+        keep: false,
         name: "dir_to_file",
         base: |p| p.a.write_at("d/x", "child", T0),
         change: |p| {
@@ -206,6 +223,7 @@ const SCENARIOS: &[Scenario] = &[
     // `-L` write-back: A's followed directory becomes a real copy first.
     Scenario {
         policy: SymlinkPolicy::CopyLinks,
+        keep: false,
         name: "materialize",
         base: |p| {
             p.a.write_at("d/x", "x", T0);
@@ -217,7 +235,57 @@ const SCENARIOS: &[Scenario] = &[
         files: true,
         held: None,
     },
+    // `-K` (issue #8): B's commits go through its link `k` to `real`, so
+    // their reserved names are in `real`.
+    Scenario {
+        policy: SymlinkPolicy::Links,
+        keep: true,
+        name: "keep_dirlinks_replace",
+        base: keep_dirlinks_base,
+        change: |p| p.a.write_at("k/f", "new content", T1),
+        files: true,
+        held: Some("real/f"),
+    },
+    Scenario {
+        policy: SymlinkPolicy::Links,
+        keep: true,
+        name: "keep_dirlinks_create",
+        base: keep_dirlinks_base,
+        change: |p| p.a.write_at("k/e/g", "new file", T1),
+        files: true,
+        held: None,
+    },
+    Scenario {
+        policy: SymlinkPolicy::Links,
+        keep: true,
+        name: "keep_dirlinks_delete",
+        base: keep_dirlinks_base,
+        change: |p| p.a.rm("k/f"),
+        files: false,
+        held: Some("real/f"),
+    },
 ];
+
+/// B's `k -> real` is adopted as A's directory `k`, with the file `k/f`.
+fn keep_dirlinks_base(p: &mut Pair) {
+    p.a.mkdir("real");
+    p.sync();
+    p.b.symlink("k", "real");
+    p.a.write_at("k/f", "old content", T0);
+    p.sync();
+    assert!(p.b.adopted("k"));
+    // `prepare`'s sync brings `real/f`, which arrived through `k`, back to
+    // A as itself.
+}
+
+/// The symlink settings of A and B for a scenario's `policy` and `keep`.
+fn opts(policy: SymlinkPolicy, keep: bool) -> [Opts; 2] {
+    let b = Opts {
+        keep_dirlinks: keep,
+        ..Opts::from(policy)
+    };
+    [policy.into(), b]
+}
 
 // ---------------------------------------------------------------------------
 // The child
@@ -227,6 +295,7 @@ const SCENARIOS: &[Scenario] = &[
 struct ChildSpec {
     dirs: [PathBuf; 3],
     policy: SymlinkPolicy,
+    keep: bool,
     named: bool,
     /// Run the cycle (true), or only open the replicas, i.e. replay.
     cycle: bool,
@@ -252,6 +321,7 @@ impl ChildSpec {
             &self.nth.to_string(),
             self.late.as_deref().unwrap_or(""),
             &format!("{:?}", self.policy),
+            if self.keep { "keep" } else { "" },
         ]
         .join("\n")
     }
@@ -269,6 +339,7 @@ impl ChildSpec {
                 .into_iter()
                 .find(|p| format!("{p:?}") == f[8])
                 .expect("a scenario policy"),
+            keep: f[9] == "keep",
         }
     }
 
@@ -322,12 +393,13 @@ fn crash_child() {
         }
         hits += 1;
     });
-    let mut pair = Pair::open_at(a, b, state, spec.policy);
+    let [oa, ob] = opts(spec.policy, spec.keep);
+    let mut pair = Pair::open_at_with(a, b, state, oa, ob);
     if spec.cycle {
         if spec.named {
             force_named(&mut pair);
         }
-        cycle(&mut pair);
+        cycle(&mut pair, spec.keep);
     }
     std::process::exit(NOT_REACHED);
 }
@@ -342,19 +414,24 @@ fn force_named(p: &mut Pair) {
 }
 
 /// The cycle that crashes: one sync, then a sweep of both quarantines.
-fn cycle(p: &mut Pair) {
-    let report = p
-        .engine
-        .sync_once(&mut p.a.replica, &mut p.b.replica)
-        .unwrap();
-    assert!(report.is_converged(), "{report:#?}");
+/// With `keep`, a second sync brings back to A what B wrote through its
+/// link (it is in the link's directory too, which syncs as itself).
+fn cycle(p: &mut Pair, keep: bool) {
+    for _ in 0..1 + usize::from(keep) {
+        let report = p
+            .engine
+            .sync_once(&mut p.a.replica, &mut p.b.replica)
+            .unwrap();
+        assert!(report.is_converged(), "{report:#?}");
+    }
     p.a.replica.sweep_quarantine();
     p.b.replica.sweep_quarantine();
 }
 
 fn prepare(sc: &Scenario) -> Pair {
-    let mut p = Pair::new(sc.policy);
-    (sc.base)(&p);
+    let [oa, ob] = opts(sc.policy, sc.keep);
+    let mut p = Pair::with(oa, ob);
+    (sc.base)(&mut p);
     p.sync();
     (sc.change)(&p);
     p
@@ -390,7 +467,7 @@ fn clean_run(sc: &Scenario, named: bool) -> Clean {
         force_named(&mut p);
     }
     hooks::start_trace();
-    cycle(&mut p);
+    cycle(&mut p, sc.keep);
     let trace = hooks::take_trace();
     p.assert_converged();
     Clean {
@@ -423,7 +500,8 @@ fn reserved(root: &Path) -> BTreeSet<(PathBuf, Vec<u8>)> {
 }
 
 /// Every reserved name left by the crash is named by an intent in the
-/// journal of its replica.
+/// journal of its replica. An intent's path is a replica path, which may
+/// lead through a `-K` link: its names are where that link leads.
 fn check_explained(dirs: &[PathBuf; 3]) -> Result<(), String> {
     for (root, id) in [(&dirs[0], ID_A), (&dirs[1], ID_B)] {
         let found = reserved(root);
@@ -432,10 +510,15 @@ fn check_explained(dirs: &[PathBuf; 3]) -> Result<(), String> {
         }
         let store = IndexStore::open(&IndexStore::path_for(&dirs[2], id), id).unwrap();
         let mut known = BTreeSet::new();
+        let real_root = root.canonicalize().unwrap();
         for (_, i) in store.journal().pending().unwrap() {
             let dir = PathBuf::from(std::ffi::OsStr::from_bytes(
                 i.path.parent().unwrap().as_bytes(),
             ));
+            let dir = match root.join(&dir).canonicalize() {
+                Ok(real) => real.strip_prefix(&real_root).unwrap().to_path_buf(),
+                Err(_) => dir,
+            };
             known.insert((dir.clone(), i.tmp.clone()));
             if let Some(old) = i.old {
                 known.insert((dir, old));
@@ -474,6 +557,7 @@ fn run_case(case: Case, want: &Outcome) -> Result<bool, String> {
         let mut child = ChildSpec {
             dirs: dirs.clone(),
             policy: sc.policy,
+            keep: sc.keep,
             named: case.named,
             cycle: true,
             point: case.point.to_owned(),
@@ -506,9 +590,11 @@ fn run_case(case: Case, want: &Outcome) -> Result<bool, String> {
             return Err(format!("reserved names left after replay: {left:?}"));
         }
     }
-    let report = pair.try_sync();
-    if !report.is_converged() {
-        return Err(format!("no convergence: {report:#?}"));
+    for _ in 0..1 + usize::from(sc.keep) {
+        let report = pair.try_sync();
+        if !report.is_converged() {
+            return Err(format!("no convergence: {report:#?}"));
+        }
     }
     pair.assert_converged();
     let got = outcome(&pair);
