@@ -286,6 +286,8 @@ Two more per-replica switches:
 
 Under the following policies, an incoming change to a followed link replaces the link with a real file, as rsync's receiver does. The file the link pointed to is never written. Set `followed_write = "conflict"` to keep the link instead and store the incoming version as a conflict copy beside it.
 
+An incoming change *beneath* a followed directory link first turns the link into a real copy of the directory. What is not synced in it (dangling links, link loops, FIFOs) is left out of the copy. The other side's files at those paths are not deleted: they are copied into the new directory.
+
 The `files_sync` process can never be tricked into writing outside a replica root, whatever the links point to. This is enforced by the kernel (`openat2` with `RESOLVE_BENEATH`), not by the policy.
 
 ### Links from the other replica

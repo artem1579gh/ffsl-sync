@@ -20,7 +20,7 @@
 //!
 //! [`LocalReplica::open`] replays the intents a crash left behind (§5.8).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
@@ -656,8 +656,23 @@ impl LocalReplica {
         };
         let mut tree = Vec::new();
         let mut sources = HashMap::new();
+        // Unmanaged entries, and what the index has beneath them.
+        let mut unmanaged = HashSet::new();
+        let mut forget = Vec::new();
         for (p, ent) in snap.iter_prefix(link)? {
             if p == *link {
+                continue;
+            }
+            let beneath = std::iter::successors(p.parent(), RelPath::parent)
+                .take_while(|a| a != link)
+                .any(|a| unmanaged.contains(&a));
+            if beneath || matches!(ent.kind, Kind::Unmanaged(_)) {
+                if !beneath {
+                    unmanaged.insert(p.clone());
+                }
+                if !(ent.is_tombstone() && ent.vv.is_empty()) {
+                    forget.push((p, ent));
+                }
                 continue;
             }
             let rel = RelPath::new(&p.as_bytes()[link.as_bytes().len() + 1..])?;
@@ -685,7 +700,8 @@ impl LocalReplica {
                     },
                 },
                 // Not synced, so not copied (rsync would skip them too).
-                Kind::Tombstone | Kind::Unmanaged(_) => continue,
+                Kind::Tombstone => continue,
+                Kind::Unmanaged(_) => unreachable!("left out above"),
             };
             if matches!(node, CopyNode::File { .. }) {
                 sources.insert(rel.clone(), (p, ent));
@@ -703,6 +719,19 @@ impl LocalReplica {
             replica: self.config.id,
             journal: self.index.journal(),
         };
+        // Issue #9: the copy leaves out what is unmanaged, so the rescan
+        // below would tombstone it with a new version, and the peer would
+        // delete its copies. Those entries become tombstones that know no
+        // version ("never seen") instead, so the peer's copies come back
+        // into the real directory. Before the link is replaced, so a crash
+        // cannot leave them to a scan; put back if it is not replaced.
+        put_entries(
+            &self.index,
+            forget
+                .iter()
+                .map(|(p, _)| (p.clone(), tombstone(VersionVector::new())))
+                .collect(),
+        )?;
         let res = commit::materialize(
             &ctx,
             &mut self.quarantine,
@@ -713,11 +742,16 @@ impl LocalReplica {
             &mut open,
         );
         let settled = self.settle(res.is_err());
+        let restored = match res {
+            Ok(commit::Outcome::Applied(_)) => Ok(()),
+            _ => put_entries(&self.index, forget.clone()),
+        };
         let out = res?;
         settled?;
+        restored?;
         match out {
             commit::Outcome::Applied(_) => {
-                tracing::info!(%link, %path, "followed directory turned into a real one for an incoming change");
+                tracing::info!(%link, %path, forgotten = forget.len(), "followed directory turned into a real one for an incoming change");
                 self.scan(Scope::Paths(vec![link.clone()]))?;
                 Ok(None)
             }
@@ -1921,6 +1955,18 @@ fn file_entry(fp: &Fingerprint, hash: [u8; 32], vv: VersionVector) -> Entry {
     entry(kind, sync_mode(fp.mode), fp.mtime_ns, vv, local)
 }
 
+/// Stores `entries` in one transaction (none if there are none).
+fn put_entries(index: &IndexStore, entries: Vec<(RelPath, Entry)>) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut txn = index.write()?;
+    for (p, mut e) in entries {
+        txn.put(&p, &mut e)?;
+    }
+    txn.commit()
+}
+
 fn tombstone(vv: VersionVector) -> Entry {
     entry(Kind::Tombstone, 0, 0, vv, LocalMeta::default())
 }
@@ -2823,6 +2869,65 @@ mod tests {
         );
         assert!(fs::symlink_metadata(fx.p("m")).unwrap().is_symlink());
         assert_eq!(fx.get("m/sub/y"), my);
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// Issue #9: what is unmanaged beneath a materialized link (and what the
+    /// index has beneath that) is not tombstoned with a new version, which
+    /// would delete the peer's copies, but known as never seen.
+    #[test]
+    fn unmanaged_beneath_a_materialized_link_is_forgotten() {
+        let mut fx = Fx::with(SymlinkPolicy::CopyLinks, false);
+        fs::create_dir_all(fx.p("d/sub")).unwrap();
+        user_file(&fx, "d/a", b"a");
+        user_file(&fx, "d/y", b"y");
+        user_file(&fx, "d/sub/z", b"z");
+        symlink("nope", fx.p("d/x")).unwrap();
+        symlink("d", fx.p("l")).unwrap();
+        fx.settled_scan();
+        fs::remove_dir_all(fx.p("d/sub")).unwrap();
+        symlink("..", fx.p("d/sub")).unwrap();
+        fx.settled_scan();
+        let unmanaged = ["l/x", "l/sub", "l/sub/z"];
+        let before: Vec<_> = unmanaged.iter().map(|p| fx.get(p)).collect();
+        assert_eq!(before[0].kind, Kind::Unmanaged(UnmanagedReason::Dangling));
+        assert_eq!(before[1].kind, Kind::Unmanaged(UnmanagedReason::Loop));
+        assert!(before[2].is_tombstone() && !before[2].vv.is_empty());
+        let logical = |e: &Entry| (e.kind.clone(), e.vv.clone());
+
+        // Not materialized (a referent changed while it was copied): the
+        // entries are as they were.
+        let path = fx.p("d/y");
+        let g = hooks::once("materialize.copied", move || append(&path, b"+"));
+        let ly = fx.get("l/y");
+        let out = fx.write("l/y", b"new", Precondition::matching(&ly), peer(1));
+        assert!(
+            matches!(out, Ok(Outcome::PreconditionFailed(_)))
+                || out.as_ref().is_err_and(Error::is_unstable),
+            "{out:?}"
+        );
+        drop(g);
+        assert!(fs::symlink_metadata(fx.p("l")).unwrap().is_symlink());
+        for (p, e) in unmanaged.iter().zip(&before) {
+            assert_eq!(logical(&fx.get(p)), logical(e), "{p}");
+        }
+
+        // Materialized: tombstones that know no version.
+        fx.settled_scan();
+        let ly = fx.get("l/y");
+        applied(fx.write("l/y", b"new", Precondition::matching(&ly), peer(1)));
+        assert!(fs::symlink_metadata(fx.p("l")).unwrap().is_dir());
+        for p in unmanaged {
+            let e = fx.get(p);
+            assert!(e.is_tombstone() && e.vv.is_empty(), "{p}: {e:?}");
+        }
+        assert_eq!(fx.settled_scan().changed, 0);
+        // What the link pointed to is still unmanaged, and untouched.
+        assert_eq!(
+            fx.get("d/x").kind,
+            Kind::Unmanaged(UnmanagedReason::Dangling)
+        );
+        assert_eq!(fx.get("d/sub").kind, Kind::Unmanaged(UnmanagedReason::Loop));
         assert!(fx.leftovers().is_empty());
     }
 

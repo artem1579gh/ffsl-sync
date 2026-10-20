@@ -567,6 +567,54 @@ fn followed_write_conflict_keeps_links(m: Mode) {
     w.pair.assert_converged();
 }
 
+/// `-L` (issue #9): turning a followed directory into a real one does not
+/// delete the peer's copies of what is unmanaged beneath it (a dangling
+/// link, a loop where a directory used to be). They come back instead.
+fn materialize_keeps_unmanaged_children(m: Mode) {
+    let mut w = World::new(m, CopyLinks, CopyLinks);
+    let b = &w.pair.b;
+    b.write_at("f", "F", NEW);
+    b.symlink("d/x", "../f");
+    b.write_at("d/y", "Y", NEW);
+    b.write_at("d/sub/z", "Z", NEW);
+    b.symlink("l", "d");
+    w.pair.sync();
+    let a = &w.pair.a;
+    assert_eq!((a.read("l/x"), a.read("l/sub/z")), ("F".into(), "Z".into()));
+
+    // On B, `l/x` dangles and `l/sub` is a loop: A keeps its copies.
+    let b = &w.pair.b;
+    b.rm("f");
+    b.rm("d/sub");
+    b.symlink("d/sub", "..");
+    w.pair.sync();
+    let a = &w.pair.a;
+    assert_eq!((a.read("l/x"), a.read("l/sub/z")), ("F".into(), "Z".into()));
+
+    // A change beneath `l` turns B's `l` into a real directory.
+    a.write_at("l/y", "A y", NEW + 1);
+    w.pair.sync();
+    let b = &w.pair.b;
+    assert!(b.is_dir("l") && !b.is_symlink("l"), "{:?}", b.ls());
+    assert_eq!(b.read("l/y"), "A y");
+    for side in [&w.pair.a, &w.pair.b] {
+        assert_eq!(side.read("l/x"), "F", "{:?}", side.ls());
+        assert_eq!(side.read("l/sub/z"), "Z", "{:?}", side.ls());
+    }
+    // What the link pointed to is untouched.
+    assert!(b.is_symlink("d/x") && b.is_symlink("d/sub"));
+    assert_eq!(b.read("d/y"), "Y");
+    // `d/x` and `d/sub` stay unmanaged on B, so only `l` is compared.
+    let under_l = |t: &Tree| {
+        let mut raw = t.raw();
+        raw.retain(|p, _| p.starts_with("l/"));
+        raw
+    };
+    assert_eq!(under_l(&w.pair.a), under_l(&w.pair.b));
+    let report = w.pair.sync();
+    assert_eq!(report.applied, 0, "{report:?}");
+}
+
 /// `-K`: B's link to a directory, where A has a real directory, is adopted;
 /// A's files are written through it. rsync `-K` agrees.
 fn keep_dirlinks_adopts_and_writes_through(m: Mode) {
@@ -656,6 +704,7 @@ both_modes! {
     munged_sender,
     copy_links_write_back,
     followed_write_conflict_keeps_links,
+    materialize_keeps_unmanaged_children,
     keep_dirlinks_adopts_and_writes_through,
     keep_dirlinks_outside_the_root,
 }
