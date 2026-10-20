@@ -2,6 +2,16 @@
 
 All times are UTC.
 
+## 0.1.8 — 2026.10.20 14:15:54
+
+Fixes [issue #7](https://github.com/artem1579gh/files_sync/issues/7): `init --b-remote` wrote the server's private key on the client, and the guide had it copied to the server (copying the whole state directory also put the client's key there). Also fixes four smaller network issues.
+
+- **Each key stays on its own host:** `init` no longer makes the key of a replica served elsewhere. The new `files_sync identity <pair> <side>` makes it on the server and prints its device ID, and the new `files_sync pin <pair> <side> <ID>` pins that ID on the client. Only the config, which holds no secrets, and a device ID go between the hosts. Existing pairs keep working; delete the client's key from the server.
+- **`RecordSync`:** the server no longer trusts the client's values. It records the sync only for its connected peer, and keeps tombstones for the retention in its own config.
+- **Harder to fingerprint:** the client sends no server name (SNI), and new certificates carry no name.
+- **Escaped server text:** the server's error messages and refusal reasons are printed with control characters escaped, so a server cannot send escape sequences to your terminal.
+- **`--sandbox`:** `init`, `identity` and `pin` now refuse it instead of silently ignoring it.
+
 ## 0.1.7 — 2026.10.19 19:57:13
 
 Fixes [issue #6](https://github.com/artem1579gh/files_sync/issues/6): a replica root that held the pair's state directory, or overlapped the other root, was refused only by `init`, by its path, and only for local replicas. Serving a home directory with the default `~/.local/state` inside it synced the replica's private key and index to the peer, and never stopped syncing.
