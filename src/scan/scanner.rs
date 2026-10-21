@@ -1213,6 +1213,23 @@ mod tests {
         assert!(l.local.via_link.is_some());
     }
 
+    /// Issue #12: a followed link whose path is too long to look up beneath
+    /// the root (`ENAMETOOLONG`, beneath followed directories) cannot be
+    /// scanned. That is an error, not a dirty path, which a daemon retried
+    /// every second.
+    #[test]
+    fn followed_link_with_a_too_long_path_is_an_error() {
+        let f = fixture();
+        fs::write(f.dir.path().join("x"), b"x").unwrap();
+        std::os::unix::fs::symlink("x", f.dir.path().join("l")).unwrap();
+        let _g = hooks::on_fault("root.in_tree_lookup", || Some(Errno::NAMETOOLONG));
+        let stats = Scanner::new(&f.root, &f.index, SymlinkPolicy::CopyLinks)
+            .scan(&Scope::Full)
+            .unwrap();
+        assert!(stats.dirty.is_empty(), "{stats:?}");
+        assert_eq!(stats.errors, [rp("l")]);
+    }
+
     #[test]
     fn long_lists_are_coalesced_or_cut_short() {
         // Short lists are left as they are.

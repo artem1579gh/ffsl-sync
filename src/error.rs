@@ -197,6 +197,24 @@ impl Error {
         matches!(self, Error::Connection { .. })
     }
 
+    /// A failure that may pass by itself, so a daemon tries again (issue
+    /// #12): an I/O error (`EIO`, `ENOSPC` in the state directory, also
+    /// inside the index database), an index another process has open, a
+    /// lost connection, or what a remote replica reported for its side but
+    /// a protocol error. Not a corrupt index, a missing root marker, or a
+    /// protocol error.
+    pub fn may_pass(&self) -> bool {
+        match self {
+            Error::Io { .. } | Error::Unstable { .. } | Error::Connection { .. } => true,
+            Error::Db(e) => matches!(
+                e,
+                redb::Error::Io(_) | redb::Error::PreviousIo | redb::Error::DatabaseAlreadyOpen
+            ),
+            Error::Remote { kind, .. } => *kind != RemoteKind::Protocol,
+            _ => false,
+        }
+    }
+
     /// The class this error is sent over the wire with.
     pub fn remote_kind(&self) -> RemoteKind {
         match self {

@@ -261,6 +261,11 @@ daemon for "live" stopped: 4 cycle(s), 5 change(s) applied, 0 conflict(s)
 
 If a change would delete most of a replica, the daemon holds those deletions back and logs `mass deletion held back` (see **Mass-deletion guard** in [§2](#2-concepts)).
 
+The daemon keeps going by itself when something goes wrong for a while:
+- **A path that cannot be synced yet**, such as a file that keeps changing, is tried again after 1 s, then after 2 s, 4 s and so on, up to every 5 minutes, unless a change to it is seen sooner. Version 0.1.12 and older tried it every second, for as long as it stayed so (issue #12).
+- **A failed sync cycle**, such as a disk error (`EIO`) or a full disk holding the state directory (`ENOSPC`), makes the daemon log `sync cycle failed; opening the replicas again`. It waits 5 s, opens both replicas again (as when it starts), and goes on. While it keeps failing, it waits twice as long each time, up to 5 minutes. Version 0.1.12 and older stopped instead (issue #12). A missing root marker, a corrupt index or a protocol error still stops it.
+- **Lost inotify events** (`inotify queue overflow; rescanning everything`): it rescans everything, and watches every directory again, including those made while the events were lost. Version 0.1.12 and older left those unwatched until the daemon restarted, so changes in them waited for the 10-minute rescan (issue #12). After the watch limit was hit (`inotify watch limit reached`), it tries to watch every directory again with each rescan, every minute, and logs `every directory is watched again` once that works (after raising `fs.inotify.max_user_watches`, for example).
+
 You can use `sync --once` and the daemon on the same pair, one at a time. Running both at once fails, because each replica's index is locked by the process that has it open.
 
 ## 6. Symlinks
@@ -628,7 +633,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 - hard links: each name is synced as a separate file;
 - FIFOs, sockets and device files: they are skipped, and the same path on the other side is left alone;
 - names starting with `.~fsync.` (temp files, and the root marker of [§2](#2-concepts));
-- anything on another filesystem mounted inside a replica root: the mount point is not crossed and is reported as an error.
+- anything on another filesystem mounted inside a replica root: the mount point is not crossed and is reported as an error. A file mounted there (a single-file bind mount, as Docker makes) is reported as `mount point inside the replica; not synced`.
 
 **Not supported yet:**
 - ignore/exclude patterns: everything in a root is synced;
@@ -650,7 +655,9 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `index database: Database already open. Cannot acquire lock.` | Another `sync`, `daemon` or `serve` for the same pair holds the index. Run one at a time. |
 | `status`: `index in use (a daemon?), and no report at …` (or ``index in use (by `serve`?)``) | Another process holds the index but has not saved a status report, e.g. a `sync --once` that is still running. Run `status` again when it has finished. |
 | A command exits with status 141 | Its stdout was closed early (e.g. `files_sync status docs \| head -3`). Its work was done; only the rest of its output was dropped. See [§9](#9-command-reference). |
-| `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s) retries it. |
+| `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s, then less and less often while it stays so) retries it. |
+| `content does not match its hash, though the file looks unchanged; rehashing it` | A program changed the file without changing its modification time (through a memory mapping, for example). The file is read again and synced as changed. |
+| A daemon logs `sync cycle failed; opening the replicas again` | A cycle failed as a whole, e.g. on a disk error or a full disk (also the one holding the state directory). The daemon opens the replicas again after a wait, and goes on. Free some space or fix the disk; nothing else is needed. See [§5](#5-continuous-sync-with-the-daemon). |
 | `Too many open files` | A sync holds files open while it works. Version 0.1.11 and older ran out of open files when one sync replaced or deleted more than a few hundred files (issue #11). Now `files_sync` raises its limit on open files to the hard limit (`ulimit -Hn`), and holds on to fewer replaced files when the limit is low. If you still see it, raise the hard limit, e.g. with `LimitNOFILE=` in a systemd unit. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |

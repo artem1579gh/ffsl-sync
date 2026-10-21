@@ -7,16 +7,25 @@ mod harness;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use files_sync::config::SymlinkPolicy;
+use files_sync::config::{ReplicaId, SymlinkPolicy};
 use files_sync::daemon::{CycleReport, Daemon, DaemonStats};
-use files_sync::fs::is_reserved;
-use files_sync::watch::{ChannelSource, Event};
-use harness::Pair;
+use files_sync::fs::{RelPath, is_reserved};
+use files_sync::index::{Entry, PeerState, VersionVector};
+use files_sync::replica::{
+    ContentReader, Housekeeping, LocalReplica, Op, Outcome, Precondition, Replica,
+};
+use files_sync::scan::{ScanStats, Scope};
+use files_sync::status::ReplicaStatus;
+use files_sync::watch::{ChannelSource, Event, Hint};
+use harness::{ID_A, ID_B, Pair, open_replica};
 
 /// What a test sees while the daemon runs.
 struct Ctl {
@@ -330,4 +339,259 @@ fn followed_referents_are_watched() {
         c.settle(Duration::from_millis(500));
     });
     p.assert_converged();
+}
+
+/// Makes the error a scan fails with.
+type ScanFault = fn() -> files_sync::Error;
+
+/// How a [`Flaky`] replica fails (issue #12).
+#[derive(Clone, Default)]
+struct Faults {
+    /// Every scan fails with this, until the replicas are opened again.
+    scan: Arc<Mutex<Option<ScanFault>>>,
+    /// Every read of this path is unstable.
+    stuck: Option<&'static str>,
+}
+
+/// A local replica with injected [`Faults`].
+struct Flaky {
+    inner: LocalReplica,
+    faults: Faults,
+}
+
+impl Replica for Flaky {
+    fn id(&self) -> ReplicaId {
+        self.inner.id()
+    }
+
+    fn scan(&mut self, scope: Scope) -> files_sync::Result<ScanStats> {
+        if let Some(fail) = *self.faults.scan.lock().unwrap() {
+            return Err(fail());
+        }
+        self.inner.scan(scope)
+    }
+
+    fn changes_since(&self, seq: u64) -> files_sync::Result<Vec<(RelPath, Entry)>> {
+        self.inner.changes_since(seq)
+    }
+
+    fn open_read(
+        &self,
+        path: &RelPath,
+        expect: &Entry,
+    ) -> files_sync::Result<Box<dyn ContentReader>> {
+        if self
+            .faults
+            .stuck
+            .is_some_and(|s| path.as_bytes() == s.as_bytes())
+        {
+            return Err(files_sync::Error::Unstable {
+                path: path.as_bytes().to_vec(),
+                reason: "stuck",
+            });
+        }
+        self.inner.open_read(path, expect)
+    }
+
+    fn apply(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        content: Option<&mut dyn Read>,
+    ) -> files_sync::Result<Outcome> {
+        self.inner.apply(path, op, pre, content)
+    }
+
+    fn watch(&mut self) -> Option<Receiver<Hint>> {
+        self.inner.watch()
+    }
+
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: Duration,
+    ) -> files_sync::Result<Vec<RelPath>> {
+        self.inner.record_sync(peer, tombstones, retention)
+    }
+
+    fn clock(&self) -> files_sync::Result<u64> {
+        self.inner.clock()
+    }
+
+    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+        self.inner.witness(floor)
+    }
+}
+
+impl Housekeeping for Flaky {
+    fn next_sweep(&self) -> Option<Instant> {
+        self.inner.next_sweep()
+    }
+
+    fn sweep(&mut self) {
+        self.inner.sweep();
+    }
+
+    fn status(&self, peer: ReplicaId) -> files_sync::Result<ReplicaStatus> {
+        self.inner.status(peer)
+    }
+}
+
+/// Two flaky replicas, opened and reopened in `dirs` (A, B, state).
+struct FlakyPair {
+    dirs: [tempfile::TempDir; 3],
+    faults: Faults,
+    /// How often the pair was opened again.
+    reopened: Arc<AtomicUsize>,
+    /// Without inotify: only the daemon's timers make cycles.
+    quiet: bool,
+}
+
+impl FlakyPair {
+    fn new(faults: Faults, quiet: bool) -> FlakyPair {
+        FlakyPair {
+            dirs: [(); 3].map(|()| tempfile::tempdir().unwrap()),
+            faults,
+            reopened: Arc::default(),
+            quiet,
+        }
+    }
+
+    fn path(&self, side: usize, rel: &str) -> PathBuf {
+        self.dirs[side].path().join(rel)
+    }
+
+    fn open(&self) -> [Flaky; 2] {
+        [ID_A, ID_B].map(|id| {
+            let side = usize::from(id == ID_B);
+            let mut inner = open_replica(
+                self.dirs[side].path(),
+                self.dirs[2].path(),
+                id,
+                SymlinkPolicy::Links,
+            );
+            if self.quiet {
+                let (tx, source) = ChannelSource::new();
+                // The source ends when its sender goes: keep it.
+                std::mem::forget(tx);
+                inner.set_event_source(Box::new(source));
+            }
+            Flaky {
+                inner,
+                faults: self.faults.clone(),
+            }
+        })
+    }
+
+    /// Runs `daemon.run_reopening` while `f` runs. Opening the pair again
+    /// clears a scan fault.
+    fn run<R>(
+        &self,
+        daemon: Daemon,
+        f: impl FnOnce(&Receiver<CycleReport>) -> R,
+    ) -> (R, files_sync::Result<DaemonStats>) {
+        let (tx, reports) = crossbeam_channel::unbounded();
+        let daemon = daemon.reports(tx);
+        let open = || {
+            self.reopened.fetch_add(1, Ordering::Relaxed);
+            *self.faults.scan.lock().unwrap() = None;
+            Ok(self.open())
+        };
+        std::thread::scope(|s| {
+            let (stop, stopped) = crossbeam_channel::bounded::<()>(1);
+            let replicas = self.open();
+            let running = s.spawn(move || daemon.run_reopening(replicas, open, drop, &stopped));
+            let out = f(&reports);
+            drop(stop);
+            (out, running.join().unwrap())
+        })
+    }
+}
+
+/// What every index operation fails with after a write failed (`ENOSPC`,
+/// `EIO`), until the database is opened again.
+fn index_io_failed() -> files_sync::Error {
+    files_sync::Error::Db(redb::Error::PreviousIo)
+}
+
+/// Issue #12: a cycle that fails with an error that may pass (here the
+/// index's, after a failed write) no longer ends the daemon: it opens the
+/// replicas again after a wait, and goes on syncing.
+#[test]
+fn a_transient_failure_reopens_the_replicas() {
+    let pair = FlakyPair::new(Faults::default(), false);
+    let (waited, stats) = pair.run(
+        Daemon::new().restart_delay(Duration::from_millis(200)),
+        |r| {
+            r.recv_timeout(START).expect("first cycle");
+            *pair.faults.scan.lock().unwrap() = Some(index_io_failed);
+            fs::write(pair.path(0, "after.txt"), "after").unwrap();
+            let t0 = Instant::now();
+            wait_until("the file reaches B", Duration::from_secs(5), || {
+                read(pair.path(1, "after.txt")).as_deref() == Some("after")
+            });
+            t0.elapsed()
+        },
+    );
+    let stats = stats.expect("the daemon stopped cleanly");
+    assert_eq!(pair.reopened.load(Ordering::Relaxed), 1);
+    assert!(stats.cycles >= 2, "{stats:?}");
+    assert!(waited >= Duration::from_millis(200), "{waited:?}");
+}
+
+/// Issue #12: an error that cannot pass (a bad index) still ends the
+/// daemon, without opening the replicas again.
+#[test]
+fn a_bad_index_ends_the_daemon() {
+    let pair = FlakyPair::new(Faults::default(), false);
+    let ((), res) = pair.run(
+        Daemon::new().restart_delay(Duration::from_millis(10)),
+        |r| {
+            r.recv_timeout(START).expect("first cycle");
+            *pair.faults.scan.lock().unwrap() = Some(|| files_sync::Error::BadIndex {
+                reason: "test".into(),
+            });
+            fs::write(pair.path(0, "after.txt"), "after").unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+        },
+    );
+    assert!(
+        matches!(res, Err(files_sync::Error::BadIndex { .. })),
+        "{res:?}"
+    );
+    assert_eq!(pair.reopened.load(Ordering::Relaxed), 0);
+}
+
+/// Issue #12: a path that every cycle leaves unresolved is tried again
+/// less and less often, not every `retry_delay`.
+#[test]
+fn a_path_that_stays_unresolved_is_retried_less_often() {
+    let faults = Faults {
+        stuck: Some("stuck.txt"),
+        ..Faults::default()
+    };
+    let pair = FlakyPair::new(faults, true);
+    fs::write(pair.path(0, "stuck.txt"), "x").unwrap();
+    let retry = Duration::from_millis(100);
+    let (cycles, _) = pair.run(Daemon::new().retry_delay(retry), |r| {
+        let first = r.recv_timeout(START).expect("first cycle");
+        assert_eq!(
+            first.report.unresolved,
+            [RelPath::new("stuck.txt").unwrap()]
+        );
+        let mut at = vec![Instant::now()];
+        let end = at[0] + Duration::from_millis(2500);
+        while let Ok(c) = r.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            assert!(!c.full, "{c:#?}");
+            assert_eq!(c.paths, [RelPath::new("stuck.txt").unwrap()]);
+            at.push(Instant::now());
+        }
+        at
+    });
+    // Retries after 0.1, 0.2, 0.4, 0.8 s… (not 25 in 2.5 s).
+    assert!((4..=6).contains(&cycles.len()), "{}", cycles.len());
+    let gaps: Vec<Duration> = cycles.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.windows(2).all(|g| g[1] > g[0]), "{gaps:?}");
 }

@@ -8,7 +8,9 @@
 //! - the **rescan timer** ([`Daemon::DEFAULT_RESCAN`]): a full cycle, the
 //!   backstop for anything the watchers missed;
 //! - a **retry**: paths a cycle left unresolved are synced again after
-//!   [`Daemon::RETRY_DELAY`], even if no new event names them;
+//!   [`Daemon::RETRY_DELAY`], even if no new event names them. The delay
+//!   doubles for each cycle in a row that leaves a path unresolved, up to
+//!   [`Daemon::MAX_RETRY_DELAY`] (issue #12);
 //! - a **quarantine deadline**: replaced old inodes are swept when their
 //!   grace period ends (§5.3 step 4(f)); they are also swept right after
 //!   each cycle, which unlinks those a write lease can be taken on;
@@ -20,11 +22,15 @@
 //! Its hints come from the server; after the hint connection was lost and
 //! made again, a full rescan is asked for.
 //!
+//! Any other failed cycle ends [`Daemon::run`]. [`Daemon::run_reopening`]
+//! then opens the replicas again and goes on, after a wait, if the error may
+//! pass ([`Error::may_pass`], issue #12).
+//!
 //! Our own writes produce inotify events too. They cause one more cycle
 //! scoped to the written paths, whose scan finds the index already up to date
 //! (§5.3 step 5), so it applies nothing: no echo.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -44,6 +50,7 @@ pub struct Daemon {
     engine: Engine,
     rescan_every: Duration,
     retry_delay: Duration,
+    restart_delay: Duration,
     reports: Option<Sender<CycleReport>>,
     status_dir: Option<PathBuf>,
 }
@@ -54,6 +61,7 @@ impl Default for Daemon {
             engine: Engine::new(),
             rescan_every: Daemon::DEFAULT_RESCAN,
             retry_delay: Daemon::RETRY_DELAY,
+            restart_delay: Daemon::RESTART_DELAY,
             reports: None,
             status_dir: None,
         }
@@ -92,6 +100,13 @@ struct Todo {
     paths: BTreeSet<RelPath>,
 }
 
+/// A path left unresolved: when to try it again, after how many cycles in a
+/// row left it so.
+struct Retry {
+    at: Instant,
+    tries: u32,
+}
+
 impl Todo {
     fn add(&mut self, hint: Hint) {
         match hint {
@@ -110,6 +125,15 @@ impl Daemon {
     pub const DEFAULT_RESCAN: Duration = Duration::from_secs(10 * 60);
     /// Delay before paths a cycle left unresolved are tried again.
     pub const RETRY_DELAY: Duration = Duration::from_secs(1);
+    /// The longest delay before a path left unresolved by many cycles in a
+    /// row is tried again (unless an event names it sooner).
+    pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
+    /// The first wait before [`Daemon::run_reopening`] opens the replicas
+    /// again; it doubles while no cycle completes in between, up to
+    /// [`Daemon::MAX_RESTART_DELAY`].
+    pub const RESTART_DELAY: Duration = Duration::from_secs(5);
+    /// See [`Daemon::RESTART_DELAY`].
+    pub const MAX_RESTART_DELAY: Duration = Duration::from_secs(5 * 60);
     /// Delay before a full cycle after a remote replica's connection was
     /// lost.
     pub const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -133,6 +157,12 @@ impl Daemon {
     /// Overrides [`Daemon::RETRY_DELAY`].
     pub fn retry_delay(mut self, delay: Duration) -> Daemon {
         self.retry_delay = delay;
+        self
+    }
+
+    /// Overrides [`Daemon::RESTART_DELAY`].
+    pub fn restart_delay(mut self, delay: Duration) -> Daemon {
+        self.restart_delay = delay;
         self
     }
 
@@ -169,27 +199,103 @@ impl Daemon {
         b: &mut dyn Housekeeping,
         stop: &Receiver<()>,
     ) -> Result<DaemonStats> {
-        let mut hints = [a.watch(), b.watch()].map(|h| h.unwrap_or_else(crossbeam_channel::never));
         let mut stats = DaemonStats::default();
+        self.run_into(a, b, stop, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// Runs [`Daemon::run`] on `replicas`, and hands them to `close` when it
+    /// returns. If it failed with an error that may pass
+    /// ([`Error::may_pass`]: `EIO`, `ENOSPC` in the state directory, …), it
+    /// waits, opens them again with `open` and goes on (issue #12). Opening
+    /// them again matters: the index database refuses every operation after
+    /// a failed write until it is reopened, and opening a replica replays
+    /// its journal as after a crash. The wait starts at [`Daemon::RESTART_DELAY`] and
+    /// doubles while no cycle completes in between. If opening them again
+    /// fails with an error that may pass, it waits and tries again.
+    ///
+    /// Fails with an error that cannot pass (a corrupt index, a missing
+    /// root marker). Returns the totals of every run when `stop` receives a
+    /// message or is closed.
+    pub fn run_reopening<R: Housekeeping>(
+        &self,
+        mut replicas: [R; 2],
+        mut open: impl FnMut() -> Result<[R; 2]>,
+        mut close: impl FnMut([R; 2]),
+        stop: &Receiver<()>,
+    ) -> Result<DaemonStats> {
+        let mut stats = DaemonStats::default();
+        let max_delay = Self::MAX_RESTART_DELAY.max(self.restart_delay);
+        let mut delay = self.restart_delay;
+        loop {
+            let cycles = stats.cycles;
+            let [a, b] = &mut replicas;
+            let res = self.run_into(a, b, stop, &mut stats);
+            close(replicas);
+            let e = match res {
+                Ok(()) => return Ok(stats),
+                Err(e) if !e.may_pass() => return Err(e),
+                Err(e) => e,
+            };
+            if stats.cycles > cycles {
+                delay = self.restart_delay;
+            }
+            tracing::warn!(error = %e, ?delay, "sync cycle failed; opening the replicas again");
+            replicas = loop {
+                select! {
+                    recv(stop) -> _ => return Ok(stats),
+                    default(delay) => {}
+                }
+                delay = (delay * 2).min(max_delay);
+                match open() {
+                    Ok(replicas) => break replicas,
+                    Err(e) if e.may_pass() => {
+                        tracing::warn!(error = %e, ?delay, "cannot open the replicas again; trying again");
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            tracing::info!("replicas open again");
+        }
+    }
+
+    /// When a path left unresolved by `tries` cycles in a row is tried again.
+    fn retry_after(&self, tries: u32) -> Duration {
+        let max = Self::MAX_RETRY_DELAY.max(self.retry_delay);
+        self.retry_delay
+            .saturating_mul(1 << tries.saturating_sub(1).min(16))
+            .min(max)
+    }
+
+    /// [`Daemon::run`], adding to `stats`.
+    fn run_into(
+        &self,
+        a: &mut dyn Housekeeping,
+        b: &mut dyn Housekeeping,
+        stop: &Receiver<()>,
+        stats: &mut DaemonStats,
+    ) -> Result<()> {
+        let mut hints = [a.watch(), b.watch()].map(|h| h.unwrap_or_else(crossbeam_channel::never));
         let mut todo = Todo {
             full: true,
             paths: BTreeSet::new(),
         };
         let mut next_full = Instant::now() + self.rescan_every;
-        let mut retry: Option<(Instant, Vec<RelPath>)> = None;
+        let mut retry: BTreeMap<RelPath, Retry> = BTreeMap::new();
         loop {
             let mut changed = false;
             let now = Instant::now();
             if now >= next_full {
                 todo.full = true;
             }
-            if retry.as_ref().is_some_and(|(at, _)| *at <= now) {
-                let (_, paths) = retry.take().expect("checked above");
-                todo.paths.extend(paths);
+            for (path, r) in retry.iter_mut().filter(|(_, r)| r.at <= now) {
+                todo.paths.insert(path.clone());
+                // Not again before the cycle's outcome, should it fail.
+                r.at = now + self.retry_after(r.tries + 1);
             }
             if !todo.is_empty() {
                 let cycle = std::mem::take(&mut todo);
-                let report = match self.cycle(a, b, cycle, &mut stats) {
+                let report = match self.cycle(a, b, cycle, stats) {
                     Ok(report) => report,
                     Err(e) if e.is_disconnected() => {
                         tracing::warn!(error = %e, delay = ?Self::RECONNECT_DELAY, "sync cycle failed; trying again");
@@ -202,12 +308,17 @@ impl Daemon {
                 if report.full {
                     next_full = Instant::now() + self.rescan_every;
                 }
-                let unresolved = &report.report.unresolved;
-                if !unresolved.is_empty() {
-                    let at = Instant::now() + self.retry_delay;
-                    let mut paths = retry.take().map(|(_, p)| p).unwrap_or_default();
-                    paths.extend(unresolved.iter().cloned());
-                    retry = Some((at, paths));
+                // Every cycle reconciles the whole indexes: a path it did
+                // not leave unresolved is done.
+                let unresolved: BTreeSet<&RelPath> = report.report.unresolved.iter().collect();
+                retry.retain(|path, _| unresolved.contains(path));
+                let now = Instant::now();
+                for path in unresolved {
+                    let r = retry
+                        .entry(path.clone())
+                        .or_insert(Retry { at: now, tries: 0 });
+                    r.tries += 1;
+                    r.at = now + self.retry_after(r.tries);
                 }
                 if let Some(tx) = &self.reports {
                     let _ = tx.send(report);
@@ -232,7 +343,7 @@ impl Daemon {
 
             let wake = [
                 Some(next_full),
-                retry.as_ref().map(|(at, _)| *at),
+                retry.values().map(|r| r.at).min(),
                 a.next_sweep(),
                 b.next_sweep(),
             ]
@@ -272,7 +383,7 @@ impl Daemon {
             }
         }
         tracing::info!(?stats, "daemon stopped");
-        Ok(stats)
+        Ok(())
     }
 
     /// Runs one cycle for `todo`.

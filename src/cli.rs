@@ -334,17 +334,25 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
                 )?;
             }
             let stop = daemon::shutdown_signals()?;
-            let [mut a, mut b] = open_pair(&cfg, &pair_dir)?;
-            tracing::info!(pair = %cfg.name, "daemon started");
             let engine = Engine::new()
                 .tombstone_retention(cfg.tombstone_retention())
                 .max_delete_percent(cfg.max_delete_percent);
+            let replicas = open_pair(&cfg, &pair_dir)?;
+            tracing::info!(pair = %cfg.name, "daemon started");
+            let reopen = || -> crate::Result<[PairReplica; 2]> {
+                Ok([
+                    PairReplica::open(&cfg, 0, &pair_dir)?,
+                    PairReplica::open(&cfg, 1, &pair_dir)?,
+                ])
+            };
+            let close = |[mut a, mut b]: [PairReplica; 2]| {
+                drain_quarantine(&mut [&mut a, &mut b]);
+                log_traffic(&[&a, &b]);
+            };
             let stats = Daemon::new()
                 .engine(engine)
                 .status_dir(pair_dir.clone())
-                .run(&mut a, &mut b, &stop)?;
-            drain_quarantine(&mut [&mut a, &mut b]);
-            log_traffic(&[&a, &b]);
+                .run_reopening(replicas, reopen, close, &stop)?;
             outln!(
                 "daemon for {:?} stopped: {} cycle(s), {} change(s) applied{}, {} conflict(s)",
                 cfg.name,

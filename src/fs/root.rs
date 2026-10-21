@@ -344,6 +344,8 @@ impl Root {
     /// If the in-tree attempt fails for another reason, the out-of-tree route
     /// must fail too (its errno is returned); if it succeeds instead, the two
     /// views of the path disagree, and the result is `EAGAIN` (unstable).
+    /// `ENAMETOOLONG` (the link's path is too long to look up) is returned
+    /// as it is.
     ///
     /// The in-tree lookup is the only one that may step through `..` (in a
     /// link's target), and with `RESOLVE_BENEATH` the kernel refuses a `..`
@@ -390,6 +392,10 @@ impl Root {
         match in_tree() {
             Ok(fd) => Ok((fd, false)),
             Err(Errno::XDEV) => direct().map(|fd| (fd, true)),
+            // The link's path is longer than `PATH_MAX` (beneath followed
+            // links), so it cannot be checked to stay in the tree. Retrying
+            // changes nothing: not unstable (issue #12).
+            Err(Errno::NAMETOOLONG) => Err(Errno::NAMETOOLONG),
             Err(_) => match direct() {
                 Ok(_) => Err(Errno::AGAIN),
                 Err(e) => Err(e),

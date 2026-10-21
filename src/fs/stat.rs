@@ -259,6 +259,7 @@ where
         Err(Errno::AGAIN) => return Ok(Err("file is leased")),
         // A socket.
         Err(Errno::NXIO) => return Ok(Err("not a regular file")),
+        Err(Errno::XDEV) => return Err(mount_point(what)),
         Err(e) => {
             return Err(match unstable_reason(e) {
                 Some(reason) => Error::Unstable {
@@ -334,6 +335,8 @@ pub struct StableReader {
     total: u64,
     recheck: Recheck,
     state: ReaderState,
+    /// Runs if the content does not hash to the expected hash.
+    on_stale_hash: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -386,7 +389,16 @@ impl StableReader {
             total: 0,
             recheck,
             state: ReaderState::Reading,
+            on_stale_hash: None,
         })
+    }
+
+    /// Calls `f` if every other check passes at EOF but the content does not
+    /// hash to the expected hash: the file changed without changing its
+    /// fingerprint (an mmap write, issue #12), so the expected hash is stale.
+    pub fn on_stale_hash(mut self, f: impl FnOnce() + Send + 'static) -> StableReader {
+        self.on_stale_hash = Some(Box::new(f));
+        self
     }
 
     /// The fingerprint when the file was opened.
@@ -422,6 +434,9 @@ impl StableReader {
             return Ok(Some(why));
         }
         if *self.hasher.finalize().as_bytes() != self.hash {
+            if let Some(f) = self.on_stale_hash.take() {
+                f();
+            }
             return Ok(Some("content differs from the expected hash"));
         }
         Ok(None)
@@ -555,6 +570,7 @@ fn open_err(what: &[u8], e: Errno) -> Error {
         Errno::LOOP => "name is a symlink",
         Errno::AGAIN => "file is leased",
         Errno::NXIO => "not a regular file",
+        Errno::XDEV => return mount_point(what),
         e => match unstable_reason(e) {
             Some(reason) => reason,
             None => {
@@ -569,6 +585,17 @@ fn open_err(what: &[u8], e: Errno) -> Error {
         path: what.to_vec(),
         reason,
     }
+}
+
+/// Opening a single name beneath its directory fails with `EXDEV` only if
+/// the name is a mount point: a file bind-mounted into the tree, as Docker
+/// does. That is no race, so it is an I/O error (the path is not synced),
+/// not [`Error::Unstable`] (retried every second by a daemon, issue #12).
+fn mount_point(what: &[u8]) -> Error {
+    Error::io(
+        format!("open {} for reading", what.escape_ascii()),
+        io::Error::other("mount point inside the replica; not synced"),
+    )
 }
 
 /// `O_RDONLY | O_NOFOLLOW | O_NOATIME`, retrying without `O_NOATIME` on EPERM
@@ -817,6 +844,57 @@ mod tests {
             "closed at EOF"
         );
         assert_eq!(r.read(&mut [0; 8]).unwrap(), 0);
+    }
+
+    /// Issue #12: a name that is a mount point (a bind-mounted file) is an
+    /// I/O error, read once; not unstable, which a daemon retries forever.
+    #[test]
+    fn a_mount_point_is_an_io_error() {
+        let mut opens = 0;
+        let res = stable_read_with(
+            b"f",
+            || {
+                opens += 1;
+                Err(Errno::XDEV)
+            },
+            |_| Ok(None),
+            &mut Discard,
+        );
+        assert!(matches!(res, Err(Error::Io { .. })), "{res:?}");
+        assert_eq!(opens, 1);
+        let err = open_err(b"f", Errno::XDEV);
+        assert!(matches!(err, Error::Io { .. }), "{err}");
+    }
+
+    /// Issue #12: a streaming read whose content does not hash to the
+    /// expected hash, though nothing else changed, says so.
+    #[test]
+    fn stale_hash_is_reported() {
+        use std::io::Read;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"data").unwrap();
+        let root = root_fd(dir.path());
+        let read = |expect: &[u8], change: bool| {
+            let parent = rustix::io::fcntl_dupfd_cloexec(root.fd(), 0).unwrap();
+            let stale = Arc::new(AtomicBool::new(false));
+            let seen = stale.clone();
+            let mut r = StableReader::open_at(b"f", parent, b"f", 4, hash(expect))
+                .unwrap()
+                .on_stale_hash(move || seen.store(true, Ordering::Relaxed));
+            let mut buf = [0; 2];
+            r.read_exact(&mut buf).unwrap();
+            if change {
+                append(&dir.path().join("f"), b"+");
+            }
+            let res = r.read_to_end(&mut Vec::new());
+            (res.is_ok(), stale.load(Ordering::Relaxed))
+        };
+        assert_eq!(read(b"data", false), (true, false));
+        assert_eq!(read(b"else", false), (false, true));
+        // A change the fingerprint shows is no stale hash.
+        assert_eq!(read(b"data", true), (false, false));
     }
 
     #[test]

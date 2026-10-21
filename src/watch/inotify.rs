@@ -17,10 +17,14 @@
 //!   matching `MOVED_TO` watches it again. `MOVE_SELF` on a directory still
 //!   mapped (its parent's `MOVED_FROM` was missed) makes its parent, and so
 //!   the whole subtree, dirty. A moved root asks for a full rescan.
-//! - **Limits:** `IN_Q_OVERFLOW` becomes [`Event::Overflow`]. If the watch
-//!   limit (`fs.inotify.max_user_watches`) is hit, some directories go
-//!   unwatched, so the source falls back to polling: an [`Event::Overflow`]
-//!   every [`InotifySource::LIMIT_POLL`].
+//! - **Limits:** `IN_Q_OVERFLOW` becomes [`Event::Overflow`], and the whole
+//!   tree is watched again: directories made while events were lost have no
+//!   watch yet (issue #12). Watching a watched directory again only refreshes
+//!   its path. If the watch limit (`fs.inotify.max_user_watches`) is hit,
+//!   some directories go unwatched, so the source falls back to polling: an
+//!   [`Event::Overflow`] every [`InotifySource::LIMIT_POLL`], each of which
+//!   tries to watch the whole tree again too. Once that succeeds (the limit
+//!   was raised, or directories were removed), polling stops.
 //! - Reserved `.~fsync.` names are ignored. Symlinks are never followed
 //!   while watching the tree.
 //! - **Followed links** (design §4.5): the replica hands over its followed
@@ -85,6 +89,8 @@ pub struct InotifySource {
     pending: Vec<Event>,
     /// Set once the watch limit was hit: when to poll next.
     poll_at: Option<Instant>,
+    /// The watch limit was hit since [`InotifySource::rewatch`] started.
+    limit_hit: bool,
 }
 
 /// An event as read, before the buffer is released.
@@ -113,6 +119,7 @@ impl InotifySource {
             aliases: HashMap::new(),
             pending: Vec::new(),
             poll_at: None,
+            limit_hit: false,
         };
         source.watch_tree(RelPath::root());
         if !source.by_id.contains_key(&source.root_id()?) {
@@ -181,12 +188,25 @@ impl InotifySource {
         }
     }
 
+    /// Watches the whole tree again, after events were lost or while the
+    /// watch limit keeps directories unwatched (issue #12). Stops polling if
+    /// every directory could be watched.
+    fn rewatch(&mut self) {
+        self.limit_hit = false;
+        self.watch_tree(RelPath::root());
+        if self.poll_at.is_some() && !self.limit_hit {
+            tracing::info!(root = %self.root.path().display(), "every directory is watched again");
+            self.poll_at = None;
+        }
+    }
+
     /// Adds (or refreshes) the watch on the open directory `dir` at `path`.
     fn add_watch(&mut self, path: &RelPath, dir: &OwnedFd) -> bool {
         let proc = format!("/proc/self/fd/{}", dir.as_raw_fd());
         let wd = match inotify::add_watch(&self.inotify, proc.as_str(), MASK) {
             Ok(wd) => wd,
             Err(Errno::NOSPC) => {
+                self.limit_hit = true;
                 if self.poll_at.is_none() {
                     tracing::warn!(
                         root = %self.root.path().display(),
@@ -319,6 +339,7 @@ impl InotifySource {
         let Raw { wd, mask, name } = raw;
         if mask.contains(ReadFlags::QUEUE_OVERFLOW) {
             tracing::warn!(root = %self.root.path().display(), "inotify queue overflow; rescanning everything");
+            self.rewatch();
             out.push(Event::Overflow);
             return;
         }
@@ -404,9 +425,10 @@ impl EventSource for InotifySource {
     fn wait(&mut self, timeout: Duration) -> Result<Vec<Event>> {
         let mut out = std::mem::take(&mut self.pending);
         let now = Instant::now();
-        if let Some(at) = self.poll_at.filter(|at| *at <= now) {
+        if self.poll_at.is_some_and(|at| at <= now) {
+            self.poll_at = Some(now + Self::LIMIT_POLL);
+            self.rewatch();
             out.push(Event::Overflow);
-            self.poll_at = Some(at.max(now) + Self::LIMIT_POLL);
         }
         let timeout = if out.is_empty() {
             timeout
@@ -644,6 +666,55 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, [Event::Overflow, Event::Overflow]);
+    }
+
+    /// Issue #12: after an overflow, the directories made while events were
+    /// lost are watched, and so is one whose watch was missing.
+    #[test]
+    fn overflow_watches_the_tree_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::create_dir(d.join("old")).unwrap();
+        let mut src = source(d);
+        // Made while the queue overflowed: their events are lost.
+        fs::create_dir_all(d.join("new/sub")).unwrap();
+        src.read_all().unwrap();
+        // Left out, as by a failed watch.
+        src.unwatch_tree(&rp("old"));
+        assert_eq!(paths(&src), [""]);
+
+        let mut out = Vec::new();
+        src.handle(
+            Raw {
+                wd: -1,
+                mask: ReadFlags::QUEUE_OVERFLOW,
+                name: None,
+            },
+            &mut out,
+        );
+        assert_eq!(out, [Event::Overflow]);
+        assert_eq!(paths(&src), ["", "new", "new/sub", "old"]);
+        fs::write(d.join("new/sub/f"), "x").unwrap();
+        fs::write(d.join("old/g"), "x").unwrap();
+        collect(&mut src, &["new/sub/f", "old/g"]);
+    }
+
+    /// Issue #12: each poll while the watch limit was hit watches the tree
+    /// again; once every directory is watched, polling stops.
+    #[test]
+    fn limit_poll_watches_the_tree_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::create_dir(d.join("left_out")).unwrap();
+        let mut src = source(d);
+        src.unwatch_tree(&rp("left_out"));
+        src.poll_at = Some(Instant::now());
+        let ev = src.wait(Duration::ZERO).unwrap();
+        assert!(ev.contains(&Event::Overflow), "{ev:?}");
+        assert_eq!(paths(&src), ["", "left_out"]);
+        assert_eq!(src.poll_at, None);
+        fs::write(d.join("left_out/f"), "x").unwrap();
+        collect(&mut src, &["left_out/f"]);
     }
 
     #[test]

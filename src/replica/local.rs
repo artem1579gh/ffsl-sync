@@ -24,6 +24,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -77,7 +78,14 @@ pub struct LocalReplica {
     /// Journal intents whose directory was not found when they were
     /// replayed: kept, and tried again after scans (issue #8).
     orphans: BTreeSet<IntentId>,
+    /// Files read since the last scan whose content did not hash to the
+    /// indexed hash, with that hash (see [`LocalReplica::mark_stale`]).
+    stale: Stale,
 }
+
+/// See [`LocalReplica::stale`]; filled by content readers, which may run on
+/// another thread (`serve`).
+type Stale = Arc<Mutex<Vec<(RelPath, [u8; 32])>>>;
 
 /// The on-disk target for a link with the canonical `target` that this
 /// replica makes at `rel` (relative to the root it is made in: a `-K`
@@ -148,6 +156,7 @@ impl LocalReplica {
             purged: None,
             remote_peer: false,
             orphans: BTreeSet::new(),
+            stale: Stale::default(),
         };
         if replica.trash.is_some() {
             replica.quarantine.set_trash(&replica.root)?;
@@ -436,6 +445,31 @@ impl LocalReplica {
         Ok(())
     }
 
+    /// Marks `racy` the entries of files whose content did not hash to the
+    /// indexed hash when read (issue #12), so the scan rehashes them. Their
+    /// fingerprint did not change (an mmap write to a page that was already
+    /// dirty does not move the mtime), so the scan's shortcut would keep the
+    /// stale hash, and every read of the file would fail the same way.
+    fn mark_stale(&mut self) -> Result<()> {
+        let stale = std::mem::take(&mut *self.stale.lock().unwrap_or_else(|e| e.into_inner()));
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let mut txn = self.index.write()?;
+        for (path, hash) in stale {
+            let Some(mut e) = txn.get(&path)? else {
+                continue;
+            };
+            if e.local.racy || !matches!(e.kind, Kind::File { hash: h, .. } if h == hash) {
+                continue;
+            }
+            tracing::info!(%path, "content does not match its hash, though the file looks unchanged; rehashing it");
+            e.local.racy = true;
+            txn.put_local(&path, &e)?;
+        }
+        txn.commit()
+    }
+
     /// After a scan that changed something (a new, retargeted or removed
     /// followed link, or a new directory beneath one), the watcher's view of
     /// the followed links is refreshed.
@@ -456,6 +490,7 @@ impl LocalReplica {
         let disk = Disk {
             root: &self.root,
             config: &self.config,
+            stale: &self.stale,
         };
         let found = (|| -> Result<Vec<Followed>> {
             let snap = self.index.read()?;
@@ -501,6 +536,7 @@ impl LocalReplica {
         Disk {
             root: &self.root,
             config: &self.config,
+            stale: &self.stale,
         }
     }
 
@@ -655,6 +691,7 @@ impl LocalReplica {
         let disk = Disk {
             root: &self.root,
             config: &self.config,
+            stale: &self.stale,
         };
         let Some(e) = snap
             .get(link)?
@@ -922,6 +959,7 @@ impl LocalReplica {
         let disk = Disk {
             root: &self.root,
             config: &self.config,
+            stale: &self.stale,
         };
         let rel = base.rel(path);
         let rel = &rel;
@@ -1231,6 +1269,7 @@ impl Replica for LocalReplica {
         // Before and after: a root removed during the scan (`rm -rf`, the
         // marker with it) fails the cycle before its deletions propagate.
         check_root_marker(&self.root, self.config.id)?;
+        self.mark_stale()?;
         let mut stats = self.scanner().scan(&scope)?;
         self.retry_orphans(&scope, &mut stats)?;
         check_root_marker(&self.root, self.config.id)?;
@@ -1516,6 +1555,7 @@ impl Base {
 struct Disk<'a> {
     root: &'a Root,
     config: &'a ReplicaConfig,
+    stale: &'a Stale,
 }
 
 impl Disk<'_> {
@@ -1689,7 +1729,16 @@ impl Disk<'_> {
             return Err(invalid(path, "not a file"));
         };
         let (fd, recheck) = self.open_indexed(snap, path, e)?;
-        StableReader::new(path.as_bytes(), fd, size, hash, recheck)
+        let stale = self.stale.clone();
+        let stale_path = path.clone();
+        Ok(
+            StableReader::new(path.as_bytes(), fd, size, hash, recheck)?.on_stale_hash(move || {
+                stale
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((stale_path, hash));
+            }),
+        )
     }
 
     /// The indexed file `e` at `path`, pinned for reads at chosen offsets
@@ -2738,6 +2787,45 @@ mod tests {
         assert!(out.as_ref().is_err_and(Error::is_unstable), "{out:?}");
         assert!(!fx.p("copy").exists());
         assert!(fx.leftovers().is_empty());
+    }
+
+    /// Issue #12: a file whose content changed without changing its
+    /// fingerprint (as an mmap write may) is rehashed once a read finds that
+    /// its content does not match the indexed hash.
+    #[test]
+    fn a_stale_hash_is_rehashed_after_a_read() {
+        let mut fx = Fx::new();
+        user_file(&fx, "f", b"new content");
+        fx.settled_scan();
+        // Indexed as if the file held other bytes when it was hashed.
+        let mut e = fx.get("f");
+        e.kind = Kind::File {
+            size: 11,
+            hash: hash(b"old content"),
+        };
+        let mut txn = fx.r.index().write().unwrap();
+        txn.put_local(&rp("f"), &e).unwrap();
+        txn.commit().unwrap();
+        fx.scan();
+        assert_eq!(fx.get("f").kind, e.kind, "the scan's shortcut keeps it");
+
+        let mut r = fx.r.open_read(&rp("f"), &wire(e.clone())).unwrap();
+        let err = Error::from_stream("read", r.read_to_end(&mut Vec::new()).unwrap_err());
+        assert!(err.is_unstable(), "{err}");
+        drop(r);
+        let stats = fx.scan();
+        assert_eq!(stats.changed, 1);
+        let now = fx.get("f");
+        assert_eq!(
+            now.kind,
+            Kind::File {
+                size: 11,
+                hash: hash(b"new content")
+            }
+        );
+        assert!(now.seq > e.seq);
+        // Once, not on every scan.
+        assert_eq!(fx.settled_scan().changed, 0);
     }
 
     #[test]
