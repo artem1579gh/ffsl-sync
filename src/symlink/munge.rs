@@ -4,7 +4,8 @@
 //! index always holds the canonical (unmunged) target. Munging always
 //! prepends the prefix and unmunging strips exactly one, so a canonical target
 //! that already starts with the prefix is munged twice and the mapping is a
-//! bijection between canonical targets and munged on-disk targets.
+//! bijection between canonical targets (never empty) and munged on-disk
+//! targets.
 
 /// rsync's `SYMLINK_PREFIX`.
 pub const PREFIX: &[u8] = b"/rsyncd-munged/";
@@ -17,16 +18,23 @@ pub fn munge(target: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether an on-disk target carries the munge prefix.
+/// Whether an on-disk target is a munged one: the munge prefix followed by
+/// a target. The prefix alone is not: no canonical target is empty (a
+/// symlink cannot point nowhere), so we never write it, and unmunged it
+/// would be a target no replica can create (issue #14).
 pub fn is_munged(raw: &[u8]) -> bool {
-    raw.starts_with(PREFIX)
+    raw.len() > PREFIX.len() && raw.starts_with(PREFIX)
 }
 
 /// The canonical form of the on-disk `raw` target: one prefix stripped. A
-/// target without the prefix (a link the user created directly in a munged
+/// target that is not munged (a link the user created directly in a munged
 /// replica) is returned unchanged; callers that care check [`is_munged`].
 pub fn unmunge(raw: &[u8]) -> Vec<u8> {
-    raw.strip_prefix(PREFIX).unwrap_or(raw).to_vec()
+    if is_munged(raw) {
+        raw[PREFIX.len()..].to_vec()
+    } else {
+        raw.to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -46,7 +54,9 @@ mod tests {
         assert!(!is_munged(b"/rsyncd-munge/x"));
         assert_eq!(unmunge(b"/rsyncd-munge/x"), b"/rsyncd-munge/x");
         assert_eq!(unmunge(b"x"), b"x");
-        assert!(is_munged(&munge(b"")));
+        // The prefix alone is not munged: it would unmunge to nothing.
+        assert!(!is_munged(PREFIX));
+        assert_eq!(unmunge(PREFIX), PREFIX);
     }
 
     /// Bytes biased towards prefixes of the munge prefix.
@@ -65,6 +75,8 @@ mod tests {
     proptest! {
         #[test]
         fn round_trip(x in arb_target()) {
+            // Canonical targets are never empty.
+            prop_assume!(!x.is_empty());
             let m = munge(&x);
             prop_assert!(is_munged(&m));
             prop_assert_eq!(unmunge(&m), x);

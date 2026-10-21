@@ -163,7 +163,7 @@ pair "docs"
     last sync:   2026-10-02 23:54:16 CEST
 ```
 
-A **tombstone** is how a replica remembers a deletion. It keeps a deleted file from being "resurrected" by the other side. Tombstones are dropped once both replicas agree on them and the retention period has passed (30 days by default; see `tombstone_retention_days` in [§10](#10-config-file-reference)).
+A **tombstone** is how a replica remembers a deletion. It keeps a deleted file from being "resurrected" by the other side. Tombstones are dropped once both replicas agree on them and the retention period has passed (30 days by default; see `tombstone_retention_days` in [§10](#10-config-file-reference)). If one replica gets a new replica ID (for example, its entry in the config was made again), the other forgets the old ID at the next sync. Version 0.1.14 and older kept waiting for the old ID, so they never dropped a tombstone again (issue #14).
 
 `sync --once` exits with status 0 when both sides converged. It exits non-zero if some path could not be synced, such as a permission error or a file that kept changing during every retry; such paths are listed in the output. Run it again later, or use the daemon.
 
@@ -171,7 +171,7 @@ A **tombstone** is how a replica remembers a deletion. It keeps a deleted file f
 
 A conflict happens when the same file was changed on both sides since the last sync. Nothing is lost:
 - The version with the **newer modification time wins** and keeps the name. On a tie, the replica with the higher ID wins.
-- The other version is renamed to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 hex digits of the losing replica's ID.
+- The other version is renamed to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 hex digits of the losing replica's ID. A name that would then start with `.~fsync.` (a file named exactly `.~fsync`) gets a `_` in front: `_.~fsync.sync-conflict-…`. Version 0.1.14 and older failed to make such a conflict copy on every sync (issue #14).
 - Both files then exist on **both** sides.
 
 ```sh
@@ -288,7 +288,7 @@ Two more per-replica switches:
 
 | Setting | rsync option | Effect |
 |---|---|---|
-| `munge_links = true` | `--munge-links` | Link targets are stored on this replica's disk with a `/rsyncd-munged/` prefix, so they cannot be followed there. The other replica sees the original target. |
+| `munge_links = true` | `--munge-links` | Link targets are stored on this replica's disk with a `/rsyncd-munged/` prefix, so they cannot be followed there. The other replica sees the original target. A link you make there without the prefix, or whose target is the prefix alone, is synced as it is. |
 | `keep_dirlinks = true` | `-K` | If this replica has a symlink to a directory where the other has a real directory, the link is kept and the directory's contents are synced *through* it. Links to directories outside the root also need `keep_dirlinks_unsafe = true`. |
 
 Under the following policies, an incoming change to a followed link replaces the link with a real file, as rsync's receiver does. The file the link pointed to is never written. Set `followed_write = "conflict"` to keep the link instead and store the incoming version as a conflict copy beside it.
@@ -634,6 +634,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 - hard links: each name is synced as a separate file;
 - FIFOs, sockets and device files: they are skipped, and the same path on the other side is left alone;
 - names starting with `.~fsync.` (temp files, and the root marker of [§2](#2-concepts));
+- paths longer than 4095 bytes (`PATH_MAX`), counted from the replica root: each is reported as `path longer than PATH_MAX; not synced`, and nothing beneath it is synced. Version 0.1.14 and older recorded them, but could not sync them, and could run out of stack or open files on a very deep tree (issue #14).
 - anything on another filesystem mounted inside a replica root: the mount point is not crossed and is reported as an error. A file mounted there (a single-file bind mount, as Docker makes) is reported as `mount point inside the replica; not synced`.
 
 **Not supported yet:**
@@ -661,6 +662,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | A daemon logs `sync cycle failed; opening the replicas again` | A cycle failed as a whole, e.g. on a disk error or a full disk (also the one holding the state directory). The daemon opens the replicas again after a wait, and goes on. Free some space or fix the disk; nothing else is needed. See [§5](#5-continuous-sync-with-the-daemon). |
 | `Too many open files` | A sync holds files open while it works. Version 0.1.11 and older ran out of open files when one sync replaced or deleted more than a few hundred files (issue #11). Now `files_sync` raises its limit on open files to the hard limit (`ulimit -Hn`), and holds on to fewer replaced files when the limit is low. If you still see it, raise the hard limit, e.g. with `LimitNOFILE=` in a systemd unit. |
 | `Permission denied` for a path inside a read-only directory | The directory is read-only on the side receiving the change, so nothing can be added to it or removed from it there. This happens when the other side made it writable, changed its content and made it read-only again, all between two syncs. Make the directory writable on that side (`chmod u+w`), sync, then make it read-only again. |
+| `version counter at its limit` | A replica sent version counters at their limit (2^62), which only a damaged index or a misbehaving replica does. The pair can no longer record changes. Stop everything that runs for the pair, delete both indexes `<replica-id>.redb` (on both hosts, for a network pair), and sync: this starts over as described in **Lost or restored index** in [§2](#2-concepts). Version 0.1.14 and older stored the counter, and then failed to read its index (`bad index`). |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
 | Warning `this replica was synced before, but its index is new (lost or deleted?)` | The replica's index was deleted (or lost) since its last sync. Its files were kept: differences with the other side are pushed there or become conflict copies, and files deleted since the last sync come back. See **Lost or restored index** in [§2](#2-concepts). |

@@ -8,4 +8,4 @@ pub mod vv;
 pub use entry::{Entry, Kind, LinkInfo, LocalMeta, UnmanagedReason, sync_mode};
 pub use journal::{Intent, IntentId, IntentOp, IntentState, Journal};
 pub use store::{Ack, DEFAULT_TOMBSTONE_RETENTION, IndexStore, PeerState, ReadTxn, WriteTxn};
-pub use vv::{Ord4, VersionVector};
+pub use vv::{MAX_COUNTER, Ord4, VersionVector};

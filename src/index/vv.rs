@@ -17,7 +17,11 @@ use crate::config::ReplicaId;
 ///
 /// Local bumps add 1 to the largest counter seen, so with every input at most
 /// 2^62 a counter cannot overflow `u64` within any realistic number of bumps,
-/// and [`VersionVector::bump`] needs no error path.
+/// and [`VersionVector::bump`] needs no error path. What is stored or sent
+/// is held to the same limit (issue #14): the index refuses to encode a
+/// larger counter, a replica refuses an op that carries one or whose local
+/// bumps would make one ([`VersionVector::can_bump`]), and the scanner
+/// leaves a path unrecorded rather than bump past it.
 pub const MAX_COUNTER: u64 = 1 << 62;
 
 /// Result of comparing two version vectors: they are partially ordered.
@@ -82,6 +86,18 @@ impl VersionVector {
     /// The `(replica, counter)` pairs, sorted by replica.
     pub fn iter(&self) -> impl Iterator<Item = (ReplicaId, u64)> + '_ {
         self.0.iter().copied()
+    }
+
+    /// Every counter is at most [`MAX_COUNTER`], so the vector can be stored
+    /// and sent.
+    pub fn within_limit(&self) -> bool {
+        self.max_counter() <= MAX_COUNTER
+    }
+
+    /// Whether [`bump_after`](Self::bump_after)`(_, floor)` keeps every
+    /// counter within [`MAX_COUNTER`].
+    pub fn can_bump(&self, floor: u64) -> bool {
+        self.max_counter().max(floor) < MAX_COUNTER
     }
 
     /// Records a local change on replica `id`: its counter becomes
@@ -348,6 +364,19 @@ mod tests {
             let bytes = postcard::to_stdvec(&bad).unwrap();
             assert!(postcard::from_bytes::<VersionVector>(&bytes).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn counter_limit() {
+        let top = vv(&[(1, 3), (2, MAX_COUNTER)]);
+        assert!(top.within_limit());
+        assert!(!top.can_bump(0));
+        assert!(!vv(&[(1, 3)]).can_bump(MAX_COUNTER));
+        let below = vv(&[(2, MAX_COUNTER - 1)]);
+        assert!(below.can_bump(0) && below.can_bump(MAX_COUNTER - 1));
+        let mut over = top.clone();
+        over.bump(r(1));
+        assert!(!over.within_limit());
     }
 
     proptest! {

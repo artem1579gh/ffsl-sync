@@ -207,10 +207,19 @@ fn with_marker(name: &[u8], split_ext: bool, marker: &str) -> Vec<u8> {
     if ext.len() + marker.len() + 1 > NAME_MAX {
         (stem, ext) = (name, &[][..]);
     }
-    let room = NAME_MAX - marker.len() - ext.len();
+    let mut room = NAME_MAX - marker.len() - ext.len();
+    // `.~fsync` + `.sync-conflict-…` would be a reserved name, which the
+    // scanner ignores and a commit refuses (issue #14): escaped with a `_`.
+    let escape = is_reserved(&[&stem[..stem.len().min(room)], marker.as_bytes()].concat());
+    if escape {
+        room -= 1;
+    }
     stem = &stem[..stem.len().min(room)];
 
-    let mut out = Vec::with_capacity(stem.len() + marker.len() + ext.len());
+    let mut out = Vec::with_capacity(NAME_MAX);
+    if escape {
+        out.push(b'_');
+    }
     out.extend_from_slice(stem);
     out.extend_from_slice(marker.as_bytes());
     out.extend_from_slice(ext);
@@ -291,6 +300,29 @@ mod tests {
             conflict_name(b"\xff.x", true, now, id),
             [&b"\xff"[..], m.as_bytes(), b".x"].concat()
         );
+    }
+
+    #[test]
+    fn conflict_and_trash_names_are_never_reserved() {
+        let now = date(2026, 10, 2).at(9, 5, 7, 0);
+        let id = ReplicaId(0xabcdef0123456789);
+        let m = ".sync-conflict-20261002-090507-abcdef0";
+        let c = |n: &[u8], split| conflict_name(n, split, now, id);
+        assert_eq!(c(b".~fsync", true), format!("_.~fsync{m}").as_bytes());
+        assert_eq!(c(b".~fsync", false), format!("_.~fsync{m}").as_bytes());
+        // Shortened to `.~fsync` to fit, with the longest extension kept.
+        let ext = [&b"."[..], &[b'e'; 255 - 38 - 7 - 1]].concat();
+        let n = c(&[&b".~fsyncXY"[..], &ext].concat(), true);
+        assert_eq!(n, [b"_.~fsyn", m.as_bytes(), &ext].concat());
+        assert_eq!(n.len(), NAME_MAX);
+        for n in [&b".~fsync"[..], b".~fsyn", b".~fsync~", b".~fsyncx.y"] {
+            assert!(!is_reserved(&c(n, true)), "{}", n.escape_ascii());
+            assert!(
+                !is_reserved(&trash_name(n, true, now)),
+                "{}",
+                n.escape_ascii()
+            );
+        }
     }
 
     #[test]

@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 use crate::fs::hooks;
-use crate::fs::root::{open_beneath, unstable_reason};
+use crate::fs::root::{open_beneath, reopen_file, unstable_reason};
 use crate::fs::{FileKind, Fingerprint, RelPath, Root, is_reserved};
 use crate::index::{
     Entry, IndexStore, Kind, LinkInfo, LocalMeta, ReadTxn, UnmanagedReason, sync_mode,
@@ -59,6 +59,13 @@ use crate::symlink::{SymlinkPolicy, Treatment, classify, is_munged, needs_refere
 /// (or later) is rehashed by the next scan. Generous next to a kernel
 /// timestamp tick (1–10 ms), to absorb the coarse clock's lag.
 pub const DEFAULT_RACY_WINDOW: Duration = Duration::from_secs(1);
+
+/// The longest path the scanner indexes, in bytes: the kernel's `PATH_MAX`
+/// (4096) less its terminating NUL. A longer one could be indexed but never
+/// opened again (reads and commits hand it, or its parent, to `openat2`
+/// from the root), so it is an error, and nothing beneath it is scanned
+/// (issue #14). It also bounds the depth of a scan, so its open fds.
+pub const MAX_PATH_LEN: usize = 4095;
 
 /// Pending index updates are committed in batches of this size.
 const FLUSH_EVERY: usize = 1024;
@@ -358,6 +365,14 @@ struct Found {
     dir: Option<OpenDir>,
 }
 
+/// A directory being listed by [`Walk::walk_dir`].
+struct Level {
+    fd: OwnedFd,
+    path: RelPath,
+    /// The names not visited yet.
+    names: std::vec::IntoIter<Vec<u8>>,
+}
+
 struct OpenDir {
     fd: OwnedFd,
     id: (u64, u64),
@@ -438,10 +453,17 @@ impl Walk<'_> {
             }
             cur = cur.join(name)?;
             let last = i + 1 == names.len();
-            match self.visit(dir.as_fd(), &cur, name, last)? {
-                Some(d) => {
+            match self.visit(dir.as_fd(), &cur, name)? {
+                Some(d) if !last && !d.followed => {
                     self.stack.push(d.id);
                     dir = d.fd;
+                }
+                Some(d) => {
+                    self.stack.push(d.id);
+                    let res = self.walk_dir(d.fd, &cur);
+                    self.stack.pop();
+                    res?;
+                    break;
                 }
                 None => break,
             }
@@ -450,36 +472,73 @@ impl Walk<'_> {
         Ok(())
     }
 
-    /// Lists the directory `fd` (at `path`) and visits each child.
+    /// Visits everything beneath the directory `fd` (at `path`, whose id is
+    /// on `self.stack`), depth first. With an explicit stack of the levels
+    /// being listed, not by recursion: a deep tree costs heap, not the
+    /// thread's stack (a `serve` connection thread has 2 MiB; issue #14).
+    /// Each level holds its directory open, at most [`MAX_PATH_LEN`] / 2.
     fn walk_dir(&mut self, fd: OwnedFd, path: &RelPath) -> Result<()> {
-        let names = match list_dir(&fd) {
-            Ok(names) => names,
-            Err(e) => {
-                self.fail(path, Error::io(format!("read directory {path}"), e));
-                return Ok(());
-            }
+        let Some(top) = self.list(fd, path.clone()) else {
+            return Ok(());
         };
-        for name in names {
-            let child = path.join(&name)?;
-            self.visit(fd.as_fd(), &child, &name, true)?;
+        let mut levels = vec![top];
+        while let Some(level) = levels.last_mut() {
+            let Some(name) = level.names.next() else {
+                levels.pop();
+                // The top level's id is the caller's.
+                if !levels.is_empty() {
+                    self.stack.pop();
+                }
+                continue;
+            };
+            let child = level.path.join(&name)?;
+            let dir = self.visit(level.fd.as_fd(), &child, &name)?;
             if self.pending.len() >= FLUSH_EVERY {
                 self.flush()?;
+            }
+            if let Some(d) = dir {
+                self.stack.push(d.id);
+                match self.list(d.fd, child) {
+                    Some(level) => levels.push(level),
+                    None => {
+                        self.stack.pop();
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    /// Observes `parent/name` (at `path`) and queues its index update. A
-    /// directory is descended into, except a real (not followed) one when
-    /// `recurse` is false: its open fd is returned instead.
+    /// The names in the directory `fd` (at `path`), to visit; `None` (and
+    /// the path failed) if it cannot be read.
+    fn list(&mut self, fd: OwnedFd, path: RelPath) -> Option<Level> {
+        match list_dir(&fd) {
+            Ok(names) => Some(Level {
+                fd,
+                path,
+                names: names.into_iter(),
+            }),
+            Err(e) => {
+                self.fail(&path, Error::io(format!("read directory {path}"), e));
+                None
+            }
+        }
+    }
+
+    /// Observes `parent/name` (at `path`) and queues its index update.
+    /// Returns a directory's open fd, to descend into.
     fn visit(
         &mut self,
         parent: BorrowedFd<'_>,
         path: &RelPath,
         name: &[u8],
-        recurse: bool,
     ) -> Result<Option<OpenDir>> {
         if self.protected.contains(path.as_bytes()) {
+            return Ok(None);
+        }
+        if path.as_bytes().len() > MAX_PATH_LEN {
+            let e = io::Error::other("path longer than PATH_MAX; not synced");
+            self.fail(path, Error::io(format!("scan {path}"), e));
             return Ok(None);
         }
         self.stats.scanned += 1;
@@ -502,16 +561,7 @@ impl Walk<'_> {
                 if self.seen.insert(path.as_bytes().to_vec()) {
                     self.record(path, old, found);
                 }
-                match dir {
-                    Some(d) if !recurse && !d.followed => Ok(Some(d)),
-                    Some(d) => {
-                        self.stack.push(d.id);
-                        let res = self.walk_dir(d.fd, path);
-                        self.stack.pop();
-                        res.map(|()| None)
-                    }
-                    None => Ok(None),
-                }
+                Ok(dir)
             }
         }
     }
@@ -780,7 +830,9 @@ impl Walk<'_> {
                 };
                 let via = via(out_of_tree, false);
                 match rfp.kind {
-                    FileKind::File => self.follow_file(parent, path, name, fp, &rfp, via, old),
+                    FileKind::File => {
+                        self.follow_file(parent, path, name, fp, &rfd, &rfp, via, old)
+                    }
                     FileKind::Dir => {
                         self.follow_dir(parent, path, name, fp, &rfd, &rfp, via, link_local)
                     }
@@ -816,8 +868,9 @@ impl Walk<'_> {
         self.dir_found(fd, rfp, Some((via, link_local)))
     }
 
-    /// Hashes the file a followed link points to. The link must still be
-    /// the same inode after the read, and the referent the one we classified.
+    /// Hashes the file a followed link points to, the one the `O_PATH` fd
+    /// `rfd` classified (reopened through it, never looked up again). The
+    /// link must still be the same inode after the read.
     #[allow(clippy::too_many_arguments)]
     fn follow_file(
         &mut self,
@@ -825,6 +878,7 @@ impl Walk<'_> {
         path: &RelPath,
         name: &[u8],
         link_fp: &Fingerprint,
+        rfd: &OwnedFd,
         rfp: &Fingerprint,
         via: LinkInfo,
         old: Option<&Entry>,
@@ -832,17 +886,9 @@ impl Walk<'_> {
         if let Some(old) = old.filter(|old| unchanged_file(old, rfp, Some(&via))) {
             return Ok(Obs::Found(found_as(old)));
         }
-        let root = self.root;
         let res = self.hasher.hash_with(
             path.as_bytes(),
-            || {
-                let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-                match root.open_referent(parent, path, name, flags | OFlags::NOATIME) {
-                    Err(Errno::PERM) => root.open_referent(parent, path, name, flags),
-                    res => res,
-                }
-                .map(|(fd, _)| fd)
-            },
+            || reopen_file(rfd.as_fd()),
             |f2| {
                 if !f2.same_file(rfp) {
                     return Ok(Some("symlink referent replaced"));
@@ -926,6 +972,18 @@ impl Walk<'_> {
                     local,
                 } => {
                     let mut vv = cur.map(|e| e.vv).unwrap_or_default();
+                    if !vv.can_bump(txn.max_counter()) {
+                        // A counter past the limit could not be read back
+                        // (issue #14): only a peer at the limit gets us here.
+                        self.fail(
+                            &u.path,
+                            Error::InvalidOp {
+                                path: u.path.as_bytes().to_vec(),
+                                reason: "version counter at its limit; change not recorded",
+                            },
+                        );
+                        continue;
+                    }
                     vv.bump_after(self.replica, txn.max_counter());
                     let tombstone = kind == Kind::Tombstone;
                     let mut entry = Entry {
@@ -1211,6 +1269,86 @@ mod tests {
         let l = f.get("d/e/l");
         assert_eq!(l.kind, f.get("d/x").kind);
         assert!(l.local.via_link.is_some());
+    }
+
+    /// Issue #14: a followed file is read through the fd that classified
+    /// it, never looked up again. A link on the chain swapped meanwhile (to
+    /// a FIFO here; as root, a device node) is never opened.
+    #[test]
+    fn a_followed_file_is_not_looked_up_again() {
+        let f = fixture();
+        let d = f.dir.path().to_owned();
+        fs::write(d.join("x"), b"x").unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            d.join("p").as_path(),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("x", d.join("m")).unwrap();
+        std::os::unix::fs::symlink("m", d.join("l")).unwrap();
+        let mut lookups = 0;
+        let _g = hooks::on_fault("root.in_tree_lookup", move || {
+            lookups += 1;
+            // `l` is classified first. A second lookup (to read it) would
+            // open the FIFO, and find it is not the classified file.
+            if lookups == 2 {
+                fs::remove_file(d.join("m")).unwrap();
+                std::os::unix::fs::symlink("p", d.join("m")).unwrap();
+            }
+            None
+        });
+        let stats = Scanner::new(&f.root, &f.index, SymlinkPolicy::CopyLinks)
+            .scan(&Scope::Full)
+            .unwrap();
+        assert!(
+            stats.dirty.is_empty() && stats.errors.is_empty(),
+            "{stats:?}"
+        );
+        assert_eq!(f.get("l").kind, f.get("x").kind);
+    }
+
+    /// Issue #14: a deep tree is walked without recursion, so in a small
+    /// stack, and a path longer than `PATH_MAX` is an error, not indexed.
+    #[test]
+    fn a_deep_tree_fits_a_small_stack_and_paths_stop_at_path_max() {
+        use rustix::fs::Mode;
+        use rustix::process::{Resource, getrlimit, setrlimit};
+        // One open fd per level.
+        let mut limit = getrlimit(Resource::Nofile);
+        limit.current = limit.maximum;
+        let _ = setrlimit(Resource::Nofile, limit);
+        let f = fixture();
+        let depth = MAX_PATH_LEN / 2 + 10;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut fd = rustix::fs::open(f.dir.path(), flags, Mode::empty()).unwrap();
+        for _ in 0..depth {
+            rustix::fs::mkdirat(&fd, "d", Mode::from_bits_truncate(0o755)).unwrap();
+            fd = rustix::fs::openat(&fd, "d", flags, Mode::empty()).unwrap();
+        }
+        drop(fd);
+        let deepest = |n: usize| rp(&vec!["d"; n].join("/"));
+        let (root, index): (&Root, &IndexStore) = (&f.root, &f.index);
+        let stats = std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(256 << 10)
+                .spawn_scoped(s, || {
+                    Scanner::new(root, index, SymlinkPolicy::Links)
+                        .scan(&Scope::Full)
+                        .unwrap()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        let longest = MAX_PATH_LEN.div_ceil(2);
+        assert_eq!(deepest(longest).as_bytes().len(), MAX_PATH_LEN);
+        assert_eq!(stats.errors, [deepest(longest + 1)]);
+        assert_eq!(stats.changed, longest as u64);
+        let entry = f.index.get(&deepest(longest)).unwrap().unwrap();
+        assert_eq!(entry.kind, Kind::Dir);
     }
 
     /// Issue #12: a followed link whose path is too long to look up beneath

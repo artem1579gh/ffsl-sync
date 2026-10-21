@@ -9,7 +9,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -422,6 +422,26 @@ pub(crate) fn follow_at(
     )
 }
 
+/// Opens the regular file pinned by the `O_PATH` fd `pin` for reading
+/// (`O_RDONLY | O_NONBLOCK`, and `O_NOATIME` where allowed), through
+/// `/proc/self/fd/N`, which names exactly the pinned inode. A followed link's
+/// referent is opened this way once its kind is known: looking the link up
+/// again could meet a chain swapped meanwhile to a device node, whose mere
+/// open can have side effects (a tape rewinds), even when it is refused
+/// right after (issue #14). Anything but a regular file is `EINVAL`.
+pub(crate) fn reopen_file(pin: BorrowedFd<'_>) -> std::result::Result<OwnedFd, Errno> {
+    let st = rustix::fs::fstat(pin)?;
+    if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::RegularFile {
+        return Err(Errno::INVAL);
+    }
+    let proc_path = format!("/proc/self/fd/{}", pin.as_raw_fd());
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::open(proc_path.as_str(), flags | OFlags::NOATIME, Mode::empty()) {
+        Err(Errno::PERM) => rustix::fs::open(proc_path.as_str(), flags, Mode::empty()),
+        res => res,
+    }
+}
+
 /// `openat2(dirfd, path, flags, RESOLVE)`.
 pub(crate) fn open_beneath(
     dirfd: BorrowedFd<'_>,
@@ -461,6 +481,37 @@ mod tests {
 
     fn rp(s: &str) -> RelPath {
         RelPath::new(s).unwrap()
+    }
+
+    #[test]
+    fn reopen_file_opens_only_a_pinned_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"x").unwrap();
+        fs::create_dir(dir.path().join("d")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            dir.path().join("p").as_path(),
+            rustix::fs::FileType::Fifo,
+            Mode::from_bits_truncate(0o600),
+            0,
+        )
+        .unwrap();
+        let pin = |name: &str| {
+            rustix::fs::open(
+                dir.path().join(name).as_path(),
+                OFlags::PATH | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+        let f = pin("f");
+        let fd = reopen_file(f.as_fd()).unwrap();
+        let fp = Fingerprint::of_fd(fd.as_fd()).unwrap();
+        assert!(fp.same_file(&Fingerprint::of_fd(f.as_fd()).unwrap()));
+        let mut buf = [0u8; 4];
+        assert_eq!(rustix::io::read(&fd, &mut buf).unwrap(), 1);
+        assert_eq!(reopen_file(pin("d").as_fd()).err(), Some(Errno::INVAL));
+        assert_eq!(reopen_file(pin("p").as_fd()).err(), Some(Errno::INVAL));
     }
 
     #[test]

@@ -102,7 +102,15 @@ fn bad(reason: impl Into<String>) -> Error {
     }
 }
 
+/// Refuses a counter above [`MAX_COUNTER`]: decoding refuses it, so every
+/// later read of the entry would fail (issue #14).
 fn encode(entry: &Entry) -> Result<Vec<u8>> {
+    if !entry.vv.within_limit() {
+        return Err(bad(format!(
+            "version vector {:?} has a counter above the limit",
+            entry.vv
+        )));
+    }
     postcard::to_stdvec(&(entry, &entry.local)).map_err(|e| bad(format!("encode entry: {e}")))
 }
 
@@ -531,8 +539,9 @@ impl WriteTxn {
     /// unchanged; a peer that dropped its tombstone keeps its record); a live
     /// entry withdraws it. Records of paths that are no tombstone any more go.
     ///
-    /// A tombstone is then removed if every peer synced with so far has
-    /// acknowledged it for at least `retention`. Neither side can resurrect it
+    /// A tombstone is then removed if `peer` has acknowledged it for at
+    /// least `retention`. A pair has one peer, so any other peer recorded
+    /// earlier (one whose replica ID changed) is forgotten, with its acks. Neither side can resurrect it
     /// then: the peer has nothing live there, and a later change on either
     /// side gets a version vector that dominates or is concurrent with the
     /// other side's tombstone, which a modification wins (§6.1). Concurrent
@@ -610,47 +619,63 @@ impl WriteTxn {
                 acks.remove(k.as_slice()).map_err(dberr)?;
             }
         }
-        let peers: Vec<ReplicaId> = {
+        // A pair has one peer. Any other one synced with before (the other
+        // replica made again, with a new ID) never syncs again, so its acks
+        // would never come and would keep every tombstone (issue #14).
+        let retired: Vec<u64> = {
             let mut table = self.txn.open_table(PEERS).map_err(dberr)?;
             table.insert(peer.0, now_ns).map_err(dberr)?;
-            let mut peers = Vec::new();
+            let mut retired = Vec::new();
             for row in table.iter().map_err(dberr)? {
-                peers.push(ReplicaId(row.map_err(dberr)?.0.value()));
+                let id = row.map_err(dberr)?.0.value();
+                if id != peer.0 {
+                    retired.push(id);
+                }
             }
-            peers
+            for &id in &retired {
+                table.remove(id).map_err(dberr)?;
+            }
+            retired
         };
+        if !retired.is_empty() {
+            let mut acks = self.txn.open_table(ACKS).map_err(dberr)?;
+            for id in retired {
+                tracing::info!(peer = %ReplicaId(id), "forgot a former peer of this replica");
+                let prefix = id.to_be_bytes();
+                let mut keys = Vec::new();
+                for row in acks.range(prefix.as_slice()..).map_err(dberr)? {
+                    let (k, _) = row.map_err(dberr)?;
+                    if !k.value().starts_with(&prefix) {
+                        break;
+                    }
+                    keys.push(k.value().to_vec());
+                }
+                for k in keys {
+                    acks.remove(k.as_slice()).map_err(dberr)?;
+                }
+            }
+        }
 
         let retention = i64::try_from(retention.as_nanos()).unwrap_or(i64::MAX);
         let mut removed = Vec::new();
         for (path, vv) in current {
-            let mut keys = Vec::new();
-            let mut acked = true;
-            {
+            let key = ack_key(peer, path.as_bytes());
+            let ack = {
                 let acks = self.txn.open_table(ACKS).map_err(dberr)?;
-                for &p in &peers {
-                    let key = ack_key(p, path.as_bytes());
-                    let ack = match acks.get(key.as_slice()).map_err(dberr)? {
-                        Some(v) => decode_ack(&key, v.value())?,
-                        None => {
-                            acked = false;
-                            break;
-                        }
-                    };
-                    if &ack.ours != vv || ack.since_ns.saturating_add(retention) > now_ns {
-                        acked = false;
-                        break;
-                    }
-                    keys.push(key);
+                match acks.get(key.as_slice()).map_err(dberr)? {
+                    Some(v) => decode_ack(&key, v.value())?,
+                    None => continue,
                 }
-            }
-            if !acked {
+            };
+            if &ack.ours != vv || ack.since_ns.saturating_add(retention) > now_ns {
                 continue;
             }
             self.remove(path)?;
-            let mut acks = self.txn.open_table(ACKS).map_err(dberr)?;
-            for key in keys {
-                acks.remove(key.as_slice()).map_err(dberr)?;
-            }
+            self.txn
+                .open_table(ACKS)
+                .map_err(dberr)?
+                .remove(key.as_slice())
+                .map_err(dberr)?;
             removed.push(path.clone());
         }
         Ok(removed)
@@ -1034,6 +1059,23 @@ mod tests {
         txn.commit().unwrap();
     }
 
+    /// A counter decoding would refuse is never written (issue #14).
+    #[test]
+    fn a_counter_above_the_limit_is_not_written() {
+        let (_dir, store) = open();
+        store.put(&p(b"f"), &mut file(b"x", MAX_COUNTER)).unwrap();
+        assert_eq!(store.max_counter().unwrap(), MAX_COUNTER);
+        let err = store.put(&p(b"g"), &mut file(b"y", MAX_COUNTER + 1));
+        assert!(matches!(err, Err(Error::BadIndex { .. })), "{err:?}");
+        let mut e = store.get(&p(b"f")).unwrap().unwrap();
+        e.vv.set(PEER, MAX_COUNTER + 1);
+        let mut txn = store.write().unwrap();
+        assert!(txn.put_local(&p(b"f"), &e).is_err());
+        drop(txn);
+        assert_eq!(store.changes_since(0).unwrap().len(), 1);
+        assert_eq!(store.max_counter().unwrap(), MAX_COUNTER);
+    }
+
     #[test]
     fn corrupt_record_is_an_error() {
         let (_dir, store) = open();
@@ -1144,6 +1186,23 @@ mod tests {
         assert_eq!(r.peers().unwrap(), [(PEER, 1100)]);
     }
 
+    /// A peer whose replica ID changed never acknowledges a tombstone
+    /// again: it is forgotten, so it does not keep them for ever (issue #14).
+    #[test]
+    fn a_retired_peer_does_not_keep_tombstones() {
+        const OLD: ReplicaId = ReplicaId(0x66);
+        let (_dir, store) = open();
+        let (t, u) = (tomb(&store, b"t", 1), tomb(&store, b"u", 2));
+        assert!(gc(&store, OLD, &[(b"u", &u, PeerState::Absent)], 900).is_empty());
+        let seen = [(&b"t"[..], &t, PeerState::Absent)];
+        assert!(gc(&store, PEER, &seen, 1000).is_empty());
+        let r = store.read().unwrap();
+        assert_eq!(r.peers().unwrap(), [(PEER, 1000)]);
+        assert_eq!(r.ack(OLD, &p(b"u")).unwrap(), None);
+        drop(r);
+        assert_eq!(gc(&store, PEER, &seen, 1100), [b"t"]);
+    }
+
     #[test]
     fn a_changed_vector_or_entry_restarts_or_drops_the_ack() {
         let (_dir, store) = open();
@@ -1177,22 +1236,6 @@ mod tests {
         assert!(gc(&store, PEER, &[], 7000).is_empty());
         assert_eq!(store.read().unwrap().ack(PEER, &p(b"t")).unwrap(), None);
         assert!(store.get(&p(b"t")).unwrap().is_some());
-    }
-
-    #[test]
-    fn every_known_peer_must_acknowledge() {
-        let (_dir, store) = open();
-        let t = tomb(&store, b"t", 1);
-        let other = ReplicaId(0x88);
-        gc(&store, other, &[(b"t", &t, PeerState::Live)], 1000);
-        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 1000).is_empty());
-        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 9000).is_empty());
-        gc(&store, other, &[(b"t", &t, PeerState::Absent)], 9000);
-        assert_eq!(
-            gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 9100),
-            [b"t"]
-        );
-        assert_eq!(store.read().unwrap().ack(other, &p(b"t")).unwrap(), None);
     }
 
     impl Entry {

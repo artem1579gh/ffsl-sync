@@ -22,10 +22,10 @@ use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{PairConfig, ReplicaId};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::fs::commit::FileMeta;
-use crate::index::{Entry, Kind, LocalMeta, PeerState, VersionVector};
+use crate::index::{Entry, Kind, LocalMeta, MAX_COUNTER, PeerState, VersionVector};
 use crate::scan::{ScanStats, Scope};
 use crate::status::ReplicaStatus;
 use crate::watch::Hint;
@@ -390,6 +390,43 @@ pub enum Op {
         mtime_ns: i64,
         vv: VersionVector,
     },
+}
+
+/// The most local bumps applying one op takes, each above the last: a
+/// conflict rename's tombstone and copy, or a declined op's kept entry and
+/// conflict copy.
+const BUMPS_PER_OP: u64 = 2;
+
+impl Op {
+    /// The version vector the op leaves at its path; `None` for
+    /// `RenameToConflict`, whose vectors are local bumps.
+    pub fn vv(&self) -> Option<&VersionVector> {
+        match self {
+            Op::WriteFile { vv, .. }
+            | Op::Mkdir { vv, .. }
+            | Op::Symlink { vv, .. }
+            | Op::Delete { vv }
+            | Op::Rmdir { vv }
+            | Op::SetMeta { vv, .. } => Some(vv),
+            Op::RenameToConflict { .. } => None,
+        }
+    }
+
+    /// Refuses the op at `path` (`InvalidOp`) if its vector, or a local bump
+    /// applying it may take above `clock` (the replica's Lamport clock; 0 if
+    /// unknown), would hold a counter above [`MAX_COUNTER`]: decoding refuses
+    /// one, so the index could not be read any more, nor the op be sent
+    /// (issue #14). Checked before anything is committed.
+    pub fn check_counters(&self, path: &RelPath, clock: u64) -> Result<()> {
+        let top = self.vv().map_or(0, VersionVector::max_counter).max(clock);
+        if top > MAX_COUNTER - BUMPS_PER_OP {
+            return Err(Error::InvalidOp {
+                path: path.as_bytes().to_vec(),
+                reason: "version counter at its limit",
+            });
+        }
+        Ok(())
+    }
 }
 
 /// What the engine expects at the path, in logical terms. The replica maps

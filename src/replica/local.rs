@@ -39,7 +39,7 @@ use crate::fs::commit::{
     self, CopyNode, Ctx, Expected, FileMeta, Quarantine, Recovered, SweepReport,
 };
 use crate::fs::layout;
-use crate::fs::root::{follow_at, path_err};
+use crate::fs::root::{follow_at, path_err, reopen_file};
 use crate::fs::{
     FileKind, Fingerprint, PinnedFile, Recheck, RelPath, Root, StableReader, open_checked, tmpname,
 };
@@ -828,16 +828,10 @@ impl LocalReplica {
         content: Option<&mut dyn Read>,
     ) -> Result<Step> {
         let id = self.config.id;
-        let theirs = match &op {
-            Op::WriteFile { vv, .. }
-            | Op::Mkdir { vv, .. }
-            | Op::Symlink { vv, .. }
-            | Op::Delete { vv }
-            | Op::Rmdir { vv }
-            | Op::SetMeta { vv, .. } => vv.clone(),
-            // The local version stays where it is; the winner's version
-            // comes next, and is declined then.
-            Op::RenameToConflict { .. } => return Ok(Step::Keep),
+        // The local version stays where it is on a `RenameToConflict`; the
+        // winner's version comes next, and is declined then.
+        let Some(theirs) = op.vv().cloned() else {
+            return Ok(Step::Keep);
         };
         let mut vv = theirs.merge(&cur.map(|e| e.vv.clone()).unwrap_or_default());
         vv.bump_after(id, txn.max_counter()?);
@@ -1395,6 +1389,7 @@ impl Replica for LocalReplica {
         if path.is_root() {
             return Err(invalid(path, "cannot apply to the replica root"));
         }
+        op.check_counters(path, self.index.max_counter()?)?;
         self.make_room();
         // A change beneath a followed directory first turns that directory
         // into a real one; once per followed directory on the way.
@@ -1788,14 +1783,23 @@ impl Disk<'_> {
         match &e.local.via_link {
             None => open_checked(path.as_bytes(), parent, name),
             Some(link) => {
-                let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-                let fd =
-                    match root.open_referent(parent.as_fd(), &rel, name, flags | OFlags::NOATIME) {
-                        Err(Errno::PERM) => root.open_referent(parent.as_fd(), &rel, name, flags),
-                        res => res,
-                    }
+                // Pinned first, and opened for reading only as the regular
+                // file it is (issue #14): never a device swapped in.
+                let flags = OFlags::PATH | OFlags::CLOEXEC;
+                let pin = root
+                    .open_referent(parent.as_fd(), &rel, name, flags)
                     .map_err(|e| path_err(e, path, "open symlink referent"))?
                     .0;
+                let fd = match reopen_file(pin.as_fd()) {
+                    Ok(fd) => fd,
+                    Err(Errno::INVAL) => {
+                        return Err(Error::Unstable {
+                            path: path.as_bytes().to_vec(),
+                            reason: "symlink referent is not a file any more",
+                        });
+                    }
+                    Err(e) => return Err(path_err(e, path, "open symlink referent")),
+                };
                 Ok((fd, link_recheck(parent, name, link.clone())))
             }
         }
@@ -2053,7 +2057,7 @@ mod tests {
     use super::*;
     use crate::config::SymlinkPolicy;
     use crate::fs::{hooks, is_reserved, is_root_marker};
-    use crate::index::{Ord4, UnmanagedReason};
+    use crate::index::{MAX_COUNTER, Ord4, UnmanagedReason};
     use std::fs;
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
@@ -2578,6 +2582,30 @@ mod tests {
 
         applied(fx.apply("l", Op::Delete { vv: peer(3) }, Precondition::matching(&e)));
         assert!(fs::symlink_metadata(fx.p("l")).is_err());
+        assert_eq!(fx.scan().changed, 0);
+
+        // The prefix alone is not munged: unmunged, it would be an empty
+        // target no peer can write (issue #14). Synced as it is.
+        symlink("/rsyncd-munged/", fx.p("p")).unwrap();
+        fx.scan();
+        let e = fx.get("p");
+        let prefix = b"/rsyncd-munged/".to_vec();
+        assert_eq!(
+            e.kind,
+            Kind::Symlink {
+                target: prefix.clone()
+            }
+        );
+        assert_eq!(e.local.raw_target, None);
+        // And written back munged, as any target.
+        applied(fx.apply("p", Op::Delete { vv: peer(4) }, Precondition::matching(&e)));
+        let op = Op::Symlink {
+            target: prefix.clone(),
+            mtime_ns: 9,
+            vv: peer(5),
+        };
+        applied(fx.apply("p", op, Precondition::Absent));
+        assert_eq!(fx.get("p").local.raw_target, Some(munge(&prefix)));
         assert_eq!(fx.scan().changed, 0);
         assert!(fx.leftovers().is_empty());
     }
@@ -3251,6 +3279,40 @@ mod tests {
         invalid_op(fx.apply("f", mkdir, Precondition::matching(&f)));
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"x");
         assert!(fx.p("d").is_dir());
+    }
+
+    /// A counter past `MAX_COUNTER` would make the index unreadable (issue
+    /// #14): an op that carries one, or whose bumps would make one, is
+    /// refused before anything is committed, and a scan leaves the change
+    /// unrecorded.
+    #[test]
+    fn counters_at_the_limit_are_refused() {
+        let mut fx = Fx::new();
+        user_file(&fx, "f.txt", b"x");
+        fx.scan();
+        let e = fx.get("f.txt");
+        let out = fx.write("g", b"y", Precondition::Absent, peer(MAX_COUNTER));
+        invalid_op(out);
+        assert!(!fx.p("g").exists());
+
+        // A peer's clock at the limit: our bumps would pass it.
+        fx.r.witness(MAX_COUNTER).unwrap();
+        let to = rp("f.sync-conflict-20260101-000000-1111222.txt");
+        let op = Op::RenameToConflict { to };
+        invalid_op(fx.apply("f.txt", op, Precondition::matching(&e)));
+        let op = Op::SetMeta {
+            mode: 0o600,
+            mtime_ns: e.mtime_ns,
+            vv: peer(2),
+        };
+        invalid_op(fx.apply("f.txt", op, Precondition::matching(&e)));
+        assert_eq!(fs::read(fx.p("f.txt")).unwrap(), b"x");
+
+        fs::write(fx.p("f.txt"), b"changed").unwrap();
+        let stats = fx.r.scan(Scope::Full).unwrap();
+        assert_eq!(stats.errors, [rp("f.txt")]);
+        assert_eq!(fx.get("f.txt").vv, e.vv);
+        assert_eq!(fx.r.changes_since(0).unwrap().len(), 1);
     }
 
     #[test]

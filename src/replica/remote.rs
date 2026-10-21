@@ -572,6 +572,8 @@ impl Replica for RemoteReplica {
         pre: Precondition,
         content: Option<&mut dyn Read>,
     ) -> Result<Outcome> {
+        // Refused here too: the server could not decode it.
+        op.check_counters(path, 0)?;
         let req = Request::Apply {
             path: path.clone(),
             op,
@@ -631,6 +633,8 @@ impl Replica for RemoteReplica {
         delta: &Delta,
         data: &mut dyn Read,
     ) -> Result<Outcome> {
+        // Refused here too: the server could not decode it.
+        op.check_counters(path, 0)?;
         let req = Request::ApplyDelta {
             path: path.clone(),
             op,
