@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.14 — 2026.10.21 12:13:13
+
+Fixes [issue #13](https://github.com/artem1579gh/files_sync/issues/13): a permission change made during a sync could be lost, read-only directories did not sync, and some changes were not saved to disk safely.
+
+- **What happened:** a `chmod` of a file at the moment a sync replaced or deleted it was overwritten. Without root, a read-only directory from the other side could not receive its files (`Permission denied`), and a copy of one that a sync had to throw away stayed behind as a `.~fsync.*` directory. After a power loss, some filesystems (e.g. btrfs) could revert a directory's new permissions, or a file a sync had put back or kept as a conflict copy, while the sync had already recorded the change. The old permissions were then synced back to the other side.
+- **Now:** a permission change made during a sync is kept, and the file is synced again. A read-only directory is created writable, filled, and then given its permissions. The same happens when the other side makes a directory read-only and adds files to it between two syncs. Such leftover copies are removed. Directory permission changes, and files put back or kept as conflict copies, are written to disk before the sync records them.
+- **Not yet:** a directory that is already read-only on the receiving side still cannot take new files. This happens when the other side made it writable, changed its content and made it read-only again, all between two syncs. Make it writable on that side and sync again (see Troubleshooting in `docs/usage.md`).
+
 ## 0.1.13 — 2026.10.21 11:41:40
 
 Fixes [issue #12](https://github.com/artem1579gh/files_sync/issues/12): the daemon could stop noticing changes, rescan some paths every second for good, or exit on an error that would have passed.
