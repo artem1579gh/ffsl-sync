@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.13 — 2026.10.21 11:41:40
+
+Fixes [issue #12](https://github.com/artem1579gh/files_sync/issues/12): the daemon could stop noticing changes, rescan some paths every second for good, or exit on an error that would have passed.
+
+- **What happened:** after the kernel dropped file change events (an inotify queue overflow), directories created in the meantime were not watched, so later changes in them went unnoticed until the next restart. A file bind-mounted into a replica, a followed link whose path is too long, or a file whose content no longer matched its recorded hash though it looked unchanged, was retried every second forever. Any error other than a lost connection, e.g. a full disk under the state directory, stopped the daemon.
+- **Now:** after lost events, or once the watch limit no longer stops it, the daemon watches every directory again. A bind-mounted file is reported once as `mount point inside the replica; not synced`, and a followed link with a too long path as an error. A file whose content does not match its hash is hashed again on the next scan. A path that stays unsettled is retried less and less often, up to every 5 minutes, unless it changes. When a sync cycle fails with an error that may pass, the daemon waits (5 s at first, doubling up to 5 minutes), opens both replicas again and carries on. A corrupt index, a protocol error or a missing root marker still stop it.
+- **Not yet:** `serve` does not reopen its own index after such an error; restart it to recover.
+
 ## 0.1.12 — 2026.10.21 10:03:14
 
 Fixes [issue #11](https://github.com/artem1579gh/files_sync/issues/11): a sync that replaced or deleted many files at once could run out of open files.
