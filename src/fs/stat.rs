@@ -806,13 +806,16 @@ mod tests {
         let parent = rustix::io::fcntl_dupfd_cloexec(root.fd(), 0).unwrap();
         let mut r = StableReader::open_at(b"f", parent, b"f", 4, hash(b"data")).unwrap();
         assert!(
-            Lease::take(root.fd(), b"f", &fp).is_none(),
+            !Lease::take(root.fd(), b"f", &fp).unwrap().is_write(),
             "open while reading"
         );
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"data");
-        assert!(Lease::take(root.fd(), b"f", &fp).is_some(), "closed at EOF");
+        assert!(
+            Lease::take(root.fd(), b"f", &fp).unwrap().is_write(),
+            "closed at EOF"
+        );
         assert_eq!(r.read(&mut [0; 8]).unwrap(), 0);
     }
 

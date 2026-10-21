@@ -1,18 +1,24 @@
-//! Write leases (`F_SETLEASE F_WRLCK`, design §5.3 step 4(b), (d) and (f)).
+//! Leases (`F_SETLEASE`, design §5.3 step 4(b), (d) and (f)).
 //!
-//! The kernel grants a write lease on a file only while no other open file
-//! description refers to it, writable mmaps included (`O_PATH` fds and the
-//! lease's own fd do not count). While we hold it, anyone else's `open`
+//! The kernel grants a write lease (`F_WRLCK`) on a file only while no other
+//! open file description refers to it, writable mmaps included (`O_PATH` fds
+//! and the lease's own fd do not count), and a read lease (`F_RDLCK`) while
+//! none is open for writing (a writable shared mmap needs such an fd too).
+//! While we hold a lease, anyone's `open` that conflicts with it (any open
+//! for a write lease, an open for writing or a truncate for a read lease)
 //! breaks it: the opener waits until we release the lease (at most
-//! `/proc/sys/fs/lease-break-time`), and `F_GETLEASE` stops returning
-//! `F_WRLCK`. So a lease that is still [`held`](Lease::held) proves that
+//! `/proc/sys/fs/lease-break-time`), and `F_GETLEASE` stops returning the
+//! lease's type. So a lease that is still [`held`](Lease::held) proves that
 //! nobody could have written to the file since it was taken, and nobody can
-//! until it is released (by dropping the [`Lease`]).
+//! until it is released (by dropping the [`Lease`]). [`Lease::take`] tries a
+//! write lease first, then a read lease (issue #10): a file only readers
+//! have open can be leased too, and a refused read lease proves that a
+//! writer has the file open ([`NoLease::Writer`]).
 //!
 //! Leases only ever shorten waits or close windows: they need a local
 //! filesystem and the caller to own the file (or `CAP_LEASE`), so every
-//! failure to take one just means "no lease" and the caller falls back to
-//! the grace timer (§5.10).
+//! other failure to take one just means "no lease" and the caller falls back
+//! to the grace timer (§5.10).
 //!
 //! A lease break also sends `SIGIO` to the holder, and `SIGIO` kills a
 //! process by default. [`Lease::take`] therefore makes the process ignore
@@ -26,47 +32,77 @@ use rustix::fs::SeekFrom;
 use crate::error::Result;
 use crate::fs::stat::{Discard, FileKind, Fingerprint, open_for_read, stable_read_with};
 
-/// A write lease on one file, held until dropped.
+/// A lease on one file, held until dropped.
 #[derive(Debug)]
 pub struct Lease {
     /// `O_RDONLY`; the lease belongs to this open file description.
     fd: OwnedFd,
+    /// `F_WRLCK` or `F_RDLCK`.
+    kind: libc::c_int,
+}
+
+/// Why [`Lease::take`] gave no lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoLease {
+    /// Even a read lease was refused: someone has the file open for writing
+    /// (or holds a lease on it).
+    Writer,
+    /// Not the expected regular file, or leases are unavailable here (an
+    /// unsupported filesystem, a file we don't own).
+    Unavailable,
 }
 
 impl Lease {
-    /// Takes a write lease on the regular file `parent/name`, which must be
-    /// the inode `expect` describes (dev and ino). `None` if it is not, if
-    /// someone else has the file open, or if leases are unavailable here.
-    /// Opening the file breaks someone else's lease on it, if there is one.
-    pub fn take(parent: BorrowedFd<'_>, name: &[u8], expect: &Fingerprint) -> Option<Lease> {
+    /// Takes a lease on the regular file `parent/name`, which must be the
+    /// inode `expect` describes (dev and ino): a write lease if nobody else
+    /// has the file open, else a read lease if nobody has it open for
+    /// writing. Opening the file breaks someone else's lease on it, if there
+    /// is one.
+    pub fn take(
+        parent: BorrowedFd<'_>,
+        name: &[u8],
+        expect: &Fingerprint,
+    ) -> std::result::Result<Lease, NoLease> {
         if expect.kind != FileKind::File {
-            return None;
+            return Err(NoLease::Unavailable);
         }
         ignore_sigio();
         let fd = match open_for_read(parent, name) {
             Ok(fd) => fd,
             Err(e) => {
                 tracing::debug!(name = %name.escape_ascii(), error = %e, "cannot open file to lease");
-                return None;
+                return Err(NoLease::Unavailable);
             }
         };
         match Fingerprint::of_fd(fd.as_fd()) {
             Ok(fp) if fp.same_file(expect) && fp.kind == FileKind::File => {}
-            _ => return None,
+            _ => return Err(NoLease::Unavailable),
         }
-        // SAFETY: fcntl on an fd we own, with integer arguments only.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLEASE, libc::F_WRLCK) } != 0 {
+        for kind in [libc::F_WRLCK, libc::F_RDLCK] {
+            // SAFETY: fcntl on an fd we own, with integer arguments only.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETLEASE, kind) } == 0 {
+                return Ok(Lease { fd, kind });
+            }
             let e = std::io::Error::last_os_error();
-            tracing::debug!(name = %name.escape_ascii(), error = %e, "no write lease");
-            return None;
+            if e.raw_os_error() != Some(libc::EAGAIN) {
+                tracing::debug!(name = %name.escape_ascii(), error = %e, "no lease");
+                return Err(NoLease::Unavailable);
+            }
         }
-        Some(Lease { fd })
+        tracing::debug!(name = %name.escape_ascii(), "no lease: open for writing");
+        Err(NoLease::Writer)
     }
 
-    /// The lease is unbroken: nobody has opened the file since it was taken.
+    /// The lease is unbroken: nobody has opened the file in a way that
+    /// conflicts with it since it was taken.
     pub fn held(&self) -> bool {
         // SAFETY: fcntl on an fd we own, with integer arguments only.
-        unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETLEASE) == libc::F_WRLCK }
+        unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETLEASE) == self.kind }
+    }
+
+    /// A write lease: nobody else had the file open at all.
+    pub fn is_write(&self) -> bool {
+        self.kind == libc::F_WRLCK
     }
 
     /// The leased file's current fingerprint.
@@ -145,20 +181,64 @@ mod tests {
         assert!(lease.held(), "reading through the lease keeps it");
         drop(lease);
 
-        let held = fs::File::open(dir.path().join("f")).unwrap();
-        assert!(
-            Lease::take(root.fd(), b"f", &fp).is_none(),
-            "an open fd refuses it"
+        assert!(Lease::take(root.fd(), b"f", &fp).unwrap().is_write());
+
+        // A reader's fd: only a read lease.
+        let reader = fs::File::open(dir.path().join("f")).unwrap();
+        let lease = Lease::take(root.fd(), b"f", &fp).expect("a read lease");
+        assert!(!lease.is_write());
+        assert!(lease.held());
+        drop(lease);
+        // A writer's fd refuses both (issue #10).
+        let writer = fs::File::options()
+            .append(true)
+            .open(dir.path().join("f"))
+            .unwrap();
+        assert_eq!(
+            Lease::take(root.fd(), b"f", &fp).unwrap_err(),
+            NoLease::Writer
         );
-        drop(held);
-        assert!(Lease::take(root.fd(), b"f", &fp).is_some());
+        drop(writer);
+        assert!(!Lease::take(root.fd(), b"f", &fp).unwrap().is_write());
+        drop(reader);
+        assert!(Lease::take(root.fd(), b"f", &fp).unwrap().is_write());
 
         // Another inode at the name, or a directory: no lease.
         fs::write(dir.path().join("g"), b"other").unwrap();
-        assert!(Lease::take(root.fd(), b"g", &fp).is_none());
+        assert_eq!(
+            Lease::take(root.fd(), b"g", &fp).unwrap_err(),
+            NoLease::Unavailable
+        );
         fs::create_dir(dir.path().join("d")).unwrap();
         let d = Fingerprint::at(root.fd(), b"d").unwrap();
-        assert!(Lease::take(root.fd(), b"d", &d).is_none());
+        assert_eq!(
+            Lease::take(root.fd(), b"d", &d).unwrap_err(),
+            NoLease::Unavailable
+        );
+    }
+
+    /// A read lease is broken by an open for writing, not by a reader's.
+    #[test]
+    fn a_read_lease_is_broken_by_a_writer() {
+        let (dir, root, fp) = fx(b"data");
+        let path = dir.path().join("f");
+        let _reader = fs::File::open(&path).unwrap();
+        let lease = Lease::take(root.fd(), b"f", &fp).unwrap();
+        assert!(!lease.is_write());
+        let _another = fs::File::open(&path).unwrap();
+        assert!(lease.held(), "readers don't break it");
+        let writer = std::thread::spawn(move || {
+            let mut f = fs::File::options().append(true).open(path).unwrap();
+            f.write_all(b"+late").unwrap();
+        });
+        let t0 = std::time::Instant::now();
+        while lease.held() {
+            assert!(t0.elapsed().as_secs() < 10, "lease never broken");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(lease);
+        writer.join().unwrap();
+        assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"data+late");
     }
 
     #[test]

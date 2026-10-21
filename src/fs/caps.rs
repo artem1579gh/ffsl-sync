@@ -436,14 +436,14 @@ impl<'a> Probe<'a> {
         }
     }
 
-    /// Takes and releases a write lease. Any failure means "no leases": they
+    /// Takes and releases a lease. Any failure means "no leases": they
     /// can be disabled (`fs.leases-enable`), unsupported by the filesystem, or
     /// refused because some other fd has the file open.
     fn probe_leases(&self, name: &[u8]) -> bool {
         let Ok(fp) = Fingerprint::at(self.root, name) else {
             return false;
         };
-        Lease::take(self.root, name, &fp).is_some_and(|lease| lease.held())
+        Lease::take(self.root, name, &fp).is_ok_and(|lease| lease.held())
     }
 
     /// Unlinks every probe name that still holds an inode we created. Anything

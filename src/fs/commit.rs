@@ -58,7 +58,7 @@ use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
 use crate::fs::hooks::point;
-use crate::fs::lease::Lease;
+use crate::fs::lease::{Lease, NoLease};
 use crate::fs::root::{RESOLVE, RelPath, Root, path_err};
 use crate::fs::stat::{Discard, FileKind, Fingerprint, stable_read};
 use crate::fs::tmpname::{self, TmpId, TmpKind};
@@ -1305,7 +1305,13 @@ fn commit_replace(
 
     // (b) Lease the old file if we can, so (d) can tell whether anyone
     // opened it in between.
-    let lease = take_lease(ctx, t, &old);
+    let lease = match take_lease(ctx, t, &old) {
+        Ok(lease) => lease,
+        Err(reason) => {
+            staged.discard()?;
+            return Ok(Outcome::PreconditionFailed(reason));
+        }
+    };
     point("replace.before_exchange");
 
     // (c) Exchange: N goes to `name`, the old occupant to the temp name.
@@ -1352,14 +1358,30 @@ fn commit_replace(
     t.finish(&staged.fp)
 }
 
-/// §5.3 step 4(b): a write lease on the pinned old file `old`, if the
-/// filesystem supports leases and nobody else has the file open. Without one,
+/// §5.3 step 4(b): a lease on the pinned old file `old`, if the filesystem
+/// supports leases and nobody has the file open for writing. Without one,
 /// the quarantine's grace period covers writers holding an fd (§5.10).
-fn take_lease(ctx: &Ctx<'_>, t: &Target<'_>, old: &Fingerprint) -> Option<Lease> {
+///
+/// The leased file must still be exactly `old`, ctime included: a write
+/// between the pin and the lease bumped its ctime, even one that put the
+/// mtime back, and any write after it needs an open, which breaks the lease.
+/// So a lease still held at (d) proves the old file unwritten since the pin
+/// (issue #10). `Err(reason)` if it changed.
+fn take_lease(
+    ctx: &Ctx<'_>,
+    t: &Target<'_>,
+    old: &Fingerprint,
+) -> std::result::Result<Option<Lease>, &'static str> {
     if !ctx.caps.leases {
-        return None;
+        return Ok(None);
     }
-    Lease::take(t.parent(), t.name, old)
+    let Ok(lease) = Lease::take(t.parent(), t.name, old) else {
+        return Ok(None);
+    };
+    match lease.fingerprint() {
+        Ok(fp) if old.unchanged(&fp) => Ok(Some(lease)),
+        _ => Err("changed since scan"),
+    }
 }
 
 /// §5.3 step 4(a): pins the object at the target name with `O_PATH|O_NOFOLLOW`
@@ -1522,7 +1544,10 @@ fn commit_delete(
     point("delete.pinned");
 
     rec.begin()?;
-    let lease = take_lease(ctx, t, &old);
+    let lease = match take_lease(ctx, t, &old) {
+        Ok(lease) => lease,
+        Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
+    };
     point("delete.before_rename");
 
     // 2. Move it aside; NOREPLACE so a reserved name is never overwritten.
@@ -1916,11 +1941,17 @@ fn put_back(
 /// both cases only with mtime and size unchanged; if it changed,
 /// [`Quarantine::sweep`] renames it to a conflict copy instead.
 ///
-/// "Nobody can write to it" means a write lease can be taken on it
-/// ([`Lease`], when the filesystem supports leases): no fd or mmap is left,
-/// and none can be opened until the lease is released. A sweep then checks
-/// and unlinks it while holding the lease, before its deadline if need be,
-/// so no write can slip in between the check and the unlink.
+/// "Nobody can write to it" means a lease can be taken on it ([`Lease`],
+/// when the filesystem supports leases): no fd or mmap open for writing is
+/// left, and none can be opened until the lease is released. A sweep then
+/// checks and unlinks it while holding the lease, before its deadline if
+/// need be, so no write can slip in between the check and the unlink.
+///
+/// A refused lease proves a writer still has the file open (issue #10): such
+/// an entry is kept past its grace period, looked at again every
+/// [`WRITER_POLL`](Quarantine::WRITER_POLL), and becomes a conflict copy if
+/// the writer still has it open after [`writer_wait`](Quarantine::set_writer_wait),
+/// so its later writes land there rather than in an unlinked inode.
 ///
 /// Each entry belongs to an intent in the journal, which outlives a crash
 /// (§5.8): the caller keeps it while [`Quarantine::holds`] it, and forgets it
@@ -1928,6 +1959,9 @@ fn put_back(
 pub struct Quarantine {
     replica: ReplicaId,
     grace: Duration,
+    /// How long an entry a writer holds open waits before it becomes a
+    /// conflict copy.
+    writer_wait: Duration,
     pending: Vec<Pending>,
     /// Where settled old inodes go instead of being unlinked (T31).
     trash: Option<Trash>,
@@ -1967,6 +2001,9 @@ struct Pending {
     _pin: OwnedFd,
     /// When the grace period started.
     since: Instant,
+    /// When a sweep past the grace period last found the file open for
+    /// writing (a refused lease), if one did.
+    writer_seen: Option<Instant>,
     /// The journal intent that records this entry.
     intent: IntentId,
     /// Try a write lease before unlinking ([`Caps::leases`] of its replica).
@@ -1992,19 +2029,43 @@ pub struct SweepReport {
 
 enum Verdict {
     Keep,
+    /// Kept because a writer still has the file open.
+    KeepForWriter,
     Unlink,
-    Conflict,
+    /// Kept as a conflict copy, for this reason.
+    Conflict(&'static str),
     Drop,
+}
+
+/// How urgently a sweep settles an entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Due {
+    /// Within its grace period: unlinked only under a lease.
+    Not,
+    /// Past it: unlinked without a lease too, unless a writer has the file
+    /// open; then it waits for the writer, up to `writer_wait`.
+    Grace,
+    /// Now ([`Quarantine::settle_dir`]): a writer's file becomes a conflict
+    /// copy at once.
+    Now,
 }
 
 impl Quarantine {
     /// Twice the watcher's debounce interval (§5.3 step 4(f), §5.9).
     pub const DEFAULT_GRACE: Duration = Duration::from_millis(400);
 
+    /// How long an entry a writer has open waits for it to close the file
+    /// by default, before it becomes a conflict copy.
+    pub const DEFAULT_WRITER_WAIT: Duration = Duration::from_secs(60);
+
+    /// How often an entry a writer has open is looked at again.
+    pub const WRITER_POLL: Duration = Duration::from_secs(1);
+
     pub fn new(replica: ReplicaId, grace: Duration) -> Quarantine {
         Quarantine {
             replica,
             grace,
+            writer_wait: Self::DEFAULT_WRITER_WAIT,
             pending: Vec::new(),
             trash: None,
         }
@@ -2043,9 +2104,19 @@ impl Quarantine {
         self.grace = grace;
     }
 
-    /// When the earliest entry becomes due for unlinking (without a lease).
+    /// Changes how long an entry a writer has open waits before it becomes
+    /// a conflict copy, for the entries already waiting too.
+    pub fn set_writer_wait(&mut self, wait: Duration) {
+        self.writer_wait = wait;
+    }
+
+    /// When the earliest entry becomes due: for unlinking without a lease,
+    /// or, while a writer has it open, for another look.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.iter().map(|p| p.since + self.grace).min()
+        self.pending
+            .iter()
+            .map(|p| p.due_at(self.grace, self.writer_wait))
+            .min()
     }
 
     /// Whether an entry of the journal intent `id` is waiting.
@@ -2098,6 +2169,7 @@ impl Quarantine {
             fp: old,
             _pin: pin,
             since: Instant::now(),
+            writer_seen: None,
             intent,
             leases: ctx.caps.leases,
         });
@@ -2106,28 +2178,39 @@ impl Quarantine {
 
     /// Processes every entry: one modified since the replace becomes a
     /// conflict copy; one unchanged that can be leased, or is past its
-    /// deadline, is unlinked; the rest wait. Errors are logged and the entry
-    /// is retried on the next sweep.
+    /// deadline, is unlinked; one past its deadline that a writer still has
+    /// open waits for it, and becomes a conflict copy once it has waited
+    /// `writer_wait`; the rest wait. Errors are logged and the entry is
+    /// retried on the next sweep.
     pub fn sweep(&mut self) -> SweepReport {
         let now = Instant::now();
-        let grace = self.grace;
-        self.process(|p| Some(now >= p.since + grace))
+        let (grace, writer_wait) = (self.grace, self.writer_wait);
+        self.process(|p| {
+            Some(if now < p.due_at(grace, writer_wait) {
+                Due::Not
+            } else if p.writer_seen.is_some() && now >= p.since + writer_wait {
+                Due::Now
+            } else {
+                Due::Grace
+            })
+        })
     }
 
     /// Settles every entry in the directory `dir` now, without waiting for
-    /// its grace period: unchanged ones are unlinked, modified ones become
-    /// conflict copies (in `dir`). [`rmdir`] calls this so quarantined
-    /// children don't keep a deleted directory non-empty (§5.7).
+    /// its grace period: unchanged ones are unlinked, modified ones, and
+    /// ones a writer still has open, become conflict copies (in `dir`).
+    /// [`rmdir`] calls this so quarantined children don't keep a deleted
+    /// directory non-empty (§5.7).
     pub fn settle_dir(&mut self, dir: &Fingerprint) -> SweepReport {
-        self.process(|p| p.dir_fp.same_file(dir).then_some(true))
+        self.process(|p| p.dir_fp.same_file(dir).then_some(Due::Now))
     }
 
     /// Sweeps the entries `due` selects (`Some(due)`), leaving the others.
-    fn process(&mut self, due: impl Fn(&Pending) -> Option<bool>) -> SweepReport {
+    fn process(&mut self, due: impl Fn(&Pending) -> Option<Due>) -> SweepReport {
         let mut report = SweepReport::default();
         let replica = self.replica;
         let trash = self.trash.as_ref();
-        self.pending.retain(|p| {
+        self.pending.retain_mut(|p| {
             let Some(due) = due(p) else { return true };
             match p.sweep(due, replica, trash, &mut report) {
                 Ok(done) => {
@@ -2147,9 +2230,21 @@ impl Quarantine {
 }
 
 impl Pending {
+    /// When the entry is next due: at the end of its grace period, or, while
+    /// a writer has it open, for another look.
+    fn due_at(&self, grace: Duration, writer_wait: Duration) -> Instant {
+        let end = self.since + grace;
+        match self.writer_seen {
+            None => end,
+            Some(seen) => (seen + Quarantine::WRITER_POLL)
+                .min(self.since + writer_wait)
+                .max(end),
+        }
+    }
+
     /// Decides what to do with the entry. An `Unlink` comes with the lease it
     /// was decided under, if any, to hold until the unlink is done.
-    fn verdict(&self, due: bool) -> Result<(Verdict, Option<Lease>)> {
+    fn verdict(&self, due: Due) -> Result<(Verdict, Option<Lease>)> {
         let Some(fp) = Fingerprint::at_opt(self.parent.as_fd(), &self.name)? else {
             return Ok((Verdict::Drop, None));
         };
@@ -2157,41 +2252,65 @@ impl Pending {
             return Ok((Verdict::Drop, None));
         }
         if !same_object(&self.fp, &fp) {
-            return Ok((Verdict::Conflict, None));
+            return Ok((Verdict::Conflict(WRITTEN), None));
         }
+        let without_lease = if due == Due::Not {
+            Verdict::Keep
+        } else {
+            Verdict::Unlink
+        };
         let lease = if self.leases {
             Lease::take(self.parent.as_fd(), &self.name, &self.fp)
         } else {
-            None
+            Err(NoLease::Unavailable)
         };
-        let Some(lease) = lease else {
-            return Ok((if due { Verdict::Unlink } else { Verdict::Keep }, None));
+        let lease = match lease {
+            Ok(lease) => lease,
+            Err(NoLease::Unavailable) => return Ok((without_lease, None)),
+            // A writer has it open, and may write to it any time (issue #10).
+            Err(NoLease::Writer) => {
+                return Ok((
+                    match due {
+                        Due::Not => Verdict::Keep,
+                        Due::Grace => Verdict::KeepForWriter,
+                        Due::Now => Verdict::Conflict(OPEN_FOR_WRITING),
+                    },
+                    None,
+                ));
+            }
         };
         point("quarantine.leased");
         // Nobody can write now; check for a write before the lease.
         if !same_object(&self.fp, &lease.fingerprint()?) {
-            Ok((Verdict::Conflict, None))
+            Ok((Verdict::Conflict(WRITTEN), None))
         } else if lease.held() {
             Ok((Verdict::Unlink, Some(lease)))
         } else {
             // Opened right after the lease was taken: look again next time.
-            Ok((if due { Verdict::Unlink } else { Verdict::Keep }, None))
+            Ok((without_lease, None))
         }
     }
 
     /// Returns whether the entry is finished.
     fn sweep(
-        &self,
-        due: bool,
+        &mut self,
+        due: Due,
         replica: ReplicaId,
         trash: Option<&Trash>,
         report: &mut SweepReport,
     ) -> Result<bool> {
+        let (verdict, _lease) = self.verdict(due)?;
         let parent = self.parent.as_fd();
         let shown = || format!("{}/{}", self.dir, self.name.escape_ascii());
-        let (verdict, _lease) = self.verdict(due)?;
         match verdict {
             Verdict::Keep => Ok(false),
+            Verdict::KeepForWriter => {
+                if self.writer_seen.is_none() {
+                    tracing::debug!(name = %shown(), "replaced file still open for writing; waiting for the writer");
+                }
+                self.writer_seen = Some(Instant::now());
+                Ok(false)
+            }
             Verdict::Drop => {
                 tracing::warn!(name = %shown(), "quarantined object vanished or was replaced; forgetting it");
                 report.dropped += 1;
@@ -2239,7 +2358,7 @@ impl Pending {
                 report.removed += 1;
                 Ok(true)
             }
-            Verdict::Conflict => {
+            Verdict::Conflict(why) => {
                 point("quarantine.before_conflict");
                 let name =
                     rename_to_conflict(parent, &self.name, &self.orig, self.fp.kind, replica)
@@ -2247,13 +2366,17 @@ impl Pending {
                             Error::io(format!("keep conflict copy of {}", shown()), e.into())
                         })?;
                 let conflict = self.dir.join(&name)?;
-                tracing::warn!(%conflict, "replaced file was written to after the replace; kept as a conflict copy");
+                tracing::warn!(%conflict, "replaced file {why}; kept as a conflict copy");
                 report.conflicts.push(conflict);
                 Ok(true)
             }
         }
     }
 }
+
+/// Why an old inode became a conflict copy.
+const WRITTEN: &str = "was written to after the replace";
+const OPEN_FOR_WRITING: &str = "is still open for writing";
 
 /// The replica path of `dir`, a path relative to the commit's root, whose
 /// replica path is `base`.
@@ -3092,20 +3215,28 @@ mod tests {
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"new");
     }
 
-    /// Done-when: an open fd keeps the old inode quarantined; once it is
-    /// closed, the next sweep unlinks it without waiting for the deadline.
+    /// Done-when: an fd open for writing keeps the old inode quarantined;
+    /// once it is closed, the next sweep unlinks it without waiting for the
+    /// deadline.
     #[test]
     fn open_fd_prevents_the_leased_unlink_until_closed() {
         let fx = Fx::leased();
         let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
         let exp = fx.user_file("f", b"old");
-        let reader = fs::File::open(fx.p("f")).unwrap();
+        let writer = fs::File::options().append(true).open(fx.p("f")).unwrap();
         applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
         assert_eq!(q.sweep(), SweepReport::default());
         assert_eq!(q.len(), 1);
         assert_eq!(fx.leftovers().len(), 1);
-        // A read-only fd never writes: once closed, the inode goes.
-        drop(reader);
+        drop(writer);
+        let report = q.sweep();
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(fx.leftovers().is_empty());
+
+        // A read-only fd never writes: a read lease is enough (issue #10).
+        let exp = fx.user_file("f", b"old");
+        let _reader = fs::File::open(fx.p("f")).unwrap();
+        applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
         let report = q.sweep();
         assert_eq!(report.removed, 1, "{report:?}");
         assert!(fx.leftovers().is_empty());
@@ -3166,6 +3297,155 @@ mod tests {
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"old+late");
         assert!(q.is_empty());
         assert!(fx.leftovers().is_empty());
+    }
+
+    // ----- Issue #10: a refused lease means a writer ---------------------
+
+    /// A writer that still has the old file open after its grace period
+    /// keeps it in quarantine (it used to be unlinked): a write 2 s later
+    /// becomes a conflict copy. A writer that closes the file without
+    /// writing lets it go.
+    #[test]
+    fn a_writer_keeps_the_old_file_past_its_grace_period() {
+        let fx = Fx::leased();
+        let mut q = quarantine();
+        let exp = fx.user_file("f.txt", b"old");
+        let mut writer = fs::File::options()
+            .append(true)
+            .open(fx.p("f.txt"))
+            .unwrap();
+        applied(replace(&fx, &mut q, "f.txt", &exp, b"new").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default());
+        assert_eq!(q.sweep(), SweepReport::default());
+        assert_eq!(q.len(), 1);
+        // Looked at again later, not in a busy loop.
+        let next = q.next_deadline().unwrap();
+        assert!(next > Instant::now() + Quarantine::WRITER_POLL / 2);
+
+        writer.write_all(b" late").unwrap();
+        let report = q.sweep();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        let name = report.conflicts[0]
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        writer.write_all(b"!").unwrap();
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late!");
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+
+        let exp = fx.user_file("g", b"old");
+        let writer = fs::File::options().append(true).open(fx.p("g")).unwrap();
+        applied(replace(&fx, &mut q, "g", &exp, b"new").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default());
+        drop(writer);
+        assert_eq!(q.sweep().removed, 1);
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// A writer that keeps the old file open for longer than `writer_wait`:
+    /// it becomes a conflict copy, which takes the writer's later writes.
+    #[test]
+    fn a_writer_open_too_long_gets_a_conflict_copy() {
+        let fx = Fx::leased();
+        let mut q = quarantine();
+        q.set_writer_wait(Duration::ZERO);
+        let exp = fx.user_file("f.txt", b"old");
+        let mut writer = fs::File::options()
+            .append(true)
+            .open(fx.p("f.txt"))
+            .unwrap();
+        applied(replace(&fx, &mut q, "f.txt", &exp, b"new").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default(), "the writer is seen");
+        let report = q.sweep();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        assert_eq!(report.finished.len(), 1);
+        let name = report.conflicts[0]
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        writer.write_all(b" late").unwrap();
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late");
+        assert_eq!(fs::read(fx.p("f.txt")).unwrap(), b"new");
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// rmdir settles a child a writer still has open as a conflict copy
+    /// (it used to unlink it), which keeps the directory.
+    #[test]
+    fn rmdir_keeps_a_child_open_for_writing() {
+        let fx = Fx::leased();
+        fs::create_dir(fx.p("d")).unwrap();
+        let exp = fx.user_file("d/b.txt", b"b");
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        let mut writer = fs::File::options()
+            .append(true)
+            .open(fx.p("d/b.txt"))
+            .unwrap();
+        assert_eq!(del(&fx, &mut q, "d/b.txt", &exp).unwrap(), Outcome::Removed);
+        let out = rmdir(&fx.ctx(), &mut q, &rp("d")).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("directory not empty"));
+        let names: Vec<_> = fs::read_dir(fx.p("d"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("b.sync-conflict-"), "{names:?}");
+        writer.write_all(b" late").unwrap();
+        assert_eq!(fs::read(fx.p("d").join(&names[0])).unwrap(), b"b late");
+        assert!(q.is_empty());
+    }
+
+    /// From a hook after the pin: rewrites the first byte of `path` in
+    /// place and puts its mtime back, so size and mtime are unchanged.
+    fn mtime_preserving_write(path: PathBuf) -> impl FnOnce() + 'static {
+        move || {
+            use std::os::unix::fs::FileExt;
+            // Past the timestamp granularity, so the write moves ctime on.
+            std::thread::sleep(Duration::from_millis(20));
+            let f = fs::File::options().write(true).open(&path).unwrap();
+            f.write_at(b"X", 0).unwrap();
+            f.set_modified(SystemTime::UNIX_EPOCH + OLD_MTIME).unwrap();
+        }
+    }
+
+    /// A large file (no rehash) written between the pin and the lease, with
+    /// its mtime put back: the leased file's ctime shows the write, so the
+    /// replace and the delete fail their precondition instead of
+    /// quarantining (and later unlinking) the user's write.
+    #[test]
+    fn a_write_before_the_lease_is_seen_by_its_ctime() {
+        let data = vec![b'o'; (REHASH_BELOW + 1) as usize];
+        for op in ["replace", "delete"] {
+            let fx = Fx::leased();
+            let exp = fx.user_file("f", &data);
+            let _g = hooks::once(
+                if op == "replace" {
+                    "replace.pinned"
+                } else {
+                    "delete.pinned"
+                },
+                mtime_preserving_write(fx.p("f")),
+            );
+            let mut q = quarantine();
+            let out = if op == "replace" {
+                replace(&fx, &mut q, "f", &exp, b"new").unwrap()
+            } else {
+                del(&fx, &mut q, "f", &exp).unwrap()
+            };
+            assert_eq!(
+                out,
+                Outcome::PreconditionFailed("changed since scan"),
+                "{op}"
+            );
+            let now = fs::read(fx.p("f")).unwrap();
+            assert_eq!(now[0], b'X', "{op}");
+            assert_eq!(now.len(), data.len(), "{op}");
+            assert!(q.is_empty(), "{op}");
+            assert!(fx.leftovers().is_empty(), "{op}");
+        }
     }
 
     /// A symlink cannot be leased: it waits for its grace period.
