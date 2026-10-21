@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.11 — 2026.10.21 09:37:54
+
+Fixes [issue #10](https://github.com/artem1579gh/files_sync/issues/10): a write by a program that kept a file open while a sync replaced or deleted it could be lost.
+
+- **What happened:** the old file was removed 0.4 s after the sync replaced or deleted it, even when the program (an editor, a database, a logger) still had it open for writing. A write after that went to a removed file. Removing a directory did the same at once to the files deleted in it.
+- **Now:** the old file is kept until the program closes it. If the program writes to it, or still has it open a minute later, it becomes a conflict copy, and the program's later writes go there. A directory being removed is kept, holding that conflict copy. A file that is only open for reading no longer delays the removal.
+- **Also:** a write just before a sync replaced or deleted a file is now noticed even if it put the file's modification time back. Before, it could go unnoticed in files of 1 MiB or more. This needs a lease on the file: the sync's user owns it, and no other program has it open for writing at that moment.
+
 ## 0.1.10 — 2026.10.20 16:19:03
 
 Fixes [issue #9](https://github.com/artem1579gh/files_sync/issues/9): with `copy-links` (`-L`) and the default `followed_write = "replace"`, a change from the other side beneath a followed directory link could delete files on the other side.
