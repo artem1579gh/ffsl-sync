@@ -209,6 +209,7 @@ Other conflict rules:
 - **File vs. directory vs. symlink at the same name:** the directory keeps the name, then the file; the loser becomes a conflict copy.
 - **Deleting a directory on one side while the other side adds files to it:** the directory is kept, with the new files in it.
 - **A program that has a file open for writing while a sync replaces or deletes it** (an editor, a database, a logger): the program keeps writing to the old file, which the sync holds on to until the program closes it. If the program writes to it, or still has it open a minute later, the old file becomes a conflict copy, and the program's later writes go there. Version 0.1.10 and older removed the old file after 0.4 s, so a later write was lost (issue #10). A sync that replaces thousands of files at once holds on to only so many old files. On a filesystem without leases, it pauses for a fraction of a second now and then, until the oldest can go. While it holds that many, a file a program has open for writing becomes a conflict copy at once, not after a minute (issue #11).
+- **Changing a file's permissions while a sync replaces or deletes it:** the new permissions are kept, and the file is synced again. Version 0.1.13 and older could overwrite a `chmod` made at that moment (issue #13).
 - **Saving the winning file again while the conflict is being synced** (or before the next sync, if that one was interrupted): the new save is a new conflict with the version just copied to the other side, so it wins by its newer modification time and the older version becomes a second conflict copy. Version 0.1.3 and older could replace the new save by the older version, without a conflict copy (issue #3).
 
 ## 5. Continuous sync with the daemon
@@ -625,7 +626,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 
 **Synced:**
 - regular files: content, permission bits (setuid/setgid are stripped) and modification time;
-- directories: their existence and permission bits;
+- directories: their existence and permission bits. A read-only directory (one its owner cannot write to) is created writable, filled, and then given its permissions. Version 0.1.13 and older failed to fill it with `Permission denied` (issue #13).
 - symlinks, according to the policy ([§6](#6-symlinks)).
 
 **Not synced:**
@@ -659,6 +660,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `content does not match its hash, though the file looks unchanged; rehashing it` | A program changed the file without changing its modification time (through a memory mapping, for example). The file is read again and synced as changed. |
 | A daemon logs `sync cycle failed; opening the replicas again` | A cycle failed as a whole, e.g. on a disk error or a full disk (also the one holding the state directory). The daemon opens the replicas again after a wait, and goes on. Free some space or fix the disk; nothing else is needed. See [§5](#5-continuous-sync-with-the-daemon). |
 | `Too many open files` | A sync holds files open while it works. Version 0.1.11 and older ran out of open files when one sync replaced or deleted more than a few hundred files (issue #11). Now `files_sync` raises its limit on open files to the hard limit (`ulimit -Hn`), and holds on to fewer replaced files when the limit is low. If you still see it, raise the hard limit, e.g. with `LimitNOFILE=` in a systemd unit. |
+| `Permission denied` for a path inside a read-only directory | The directory is read-only on the side receiving the change, so nothing can be added to it or removed from it there. This happens when the other side made it writable, changed its content and made it read-only again, all between two syncs. Make the directory writable on that side (`chmod u+w`), sync, then make it read-only again. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
 | Warning `this replica was synced before, but its index is new (lost or deleted?)` | The replica's index was deleted (or lost) since its last sync. Its files were kept: differences with the other side are pushed there or become conflict copies, and files deleted since the last sync come back. See **Lost or restored index** in [§2](#2-concepts). |

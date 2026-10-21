@@ -11,7 +11,11 @@
 //!    from a directory.
 //! 3. [`PhaseKind::Creates`]: creates and updates, depth ascending
 //!    (directories before their children), including the create half of a
-//!    type change and every `SetMeta`.
+//!    type change and every `SetMeta` but those of the next phase.
+//! 4. [`PhaseKind::DirModes`]: directory modes that take away the owner's
+//!    read, write or search permission, depth descending (issue #13). Such
+//!    a directory could not take its new children (`EACCES`), so it is
+//!    created with `u+rwx` in phase 3, and given its mode once they are in.
 //!
 //! A path has at most one step per phase and side, and its steps only make
 //! sense in order: when one does not apply, the executor should mark the
@@ -35,6 +39,7 @@ pub enum PhaseKind {
     Conflicts,
     Deletes,
     Creates,
+    DirModes,
 }
 
 /// Steps that may run in the listed order once the previous phase is done.
@@ -104,6 +109,7 @@ struct Planner {
     conflicts: Vec<Step>,
     deletes: Vec<Step>,
     creates: Vec<Step>,
+    dir_modes: Vec<Step>,
 }
 
 impl Planner {
@@ -125,9 +131,7 @@ impl Planner {
         match target {
             None if entry.is_tombstone() => {}
             Some(t) if entry.is_tombstone() => self.deletes.push(remove(to, path, t, vv)),
-            None => self
-                .creates
-                .push(create(to, path, entry, vv, Precondition::Absent)),
+            None => self.create(to, path, entry, vv),
             Some(t) => {
                 let (dir, was_dir) = (entry.kind == Kind::Dir, t.kind == Kind::Dir);
                 if dir != was_dir {
@@ -135,12 +139,15 @@ impl Planner {
                     // create. The tombstone keeps the old vector, so if the
                     // create does not happen the pushed entry still dominates.
                     self.deletes.push(remove(to, path, t, &t.vv));
-                    self.creates
-                        .push(create(to, path, entry, vv, Precondition::Absent));
+                    self.create(to, path, entry, vv);
                 } else if entry.kind == t.kind {
                     // Same content (or both directories): metadata and vv.
-                    self.creates
-                        .push(set_meta(to, path, t, entry.mode, entry.mtime_ns, vv));
+                    let step = set_meta(to, path, t, entry.mode, entry.mtime_ns, vv);
+                    if t.kind == Kind::Dir && entry.mode != t.mode && locks_out(entry.mode) {
+                        self.dir_modes.push(step);
+                    } else {
+                        self.creates.push(step);
+                    }
                 } else {
                     // File ↔ symlink, or new content: replaced in one commit.
                     let pre = Precondition::matching(t);
@@ -150,22 +157,54 @@ impl Planner {
         }
     }
 
+    /// Creates `entry` with `vv` where side `to` holds nothing live. A
+    /// directory whose mode [locks out](locks_out) its owner is made with
+    /// `u+rwx` and a version vector that knows nothing yet, and gets its
+    /// mode and `vv` in the last phase: an interrupted cycle leaves it
+    /// dominated by the pushed entry, so the next one retries the mode.
+    fn create(&mut self, to: Side, path: &RelPath, entry: &Entry, vv: &VersionVector) {
+        if entry.kind != Kind::Dir || !locks_out(entry.mode) {
+            self.creates
+                .push(create(to, path, entry, vv, Precondition::Absent));
+            return;
+        }
+        let open = Entry::new(
+            Kind::Dir,
+            entry.mode | 0o700,
+            entry.mtime_ns,
+            VersionVector::new(),
+        );
+        let mkdir = create(to, path, &open, &open.vv, Precondition::Absent);
+        self.creates.push(mkdir);
+        self.dir_modes
+            .push(set_meta(to, path, &open, entry.mode, entry.mtime_ns, vv));
+    }
+
     fn finish(mut self) -> Vec<Phase> {
         self.conflicts.sort_by(|x, y| x.path.cmp(&y.path));
         self.deletes
             .sort_by_key(|s| (Reverse(s.path.depth()), s.path.clone(), s.side));
         self.creates
             .sort_by_key(|s| (s.path.depth(), s.path.clone(), s.side));
+        self.dir_modes
+            .sort_by_key(|s| (Reverse(s.path.depth()), s.path.clone(), s.side));
         [
             (PhaseKind::Conflicts, self.conflicts),
             (PhaseKind::Deletes, self.deletes),
             (PhaseKind::Creates, self.creates),
+            (PhaseKind::DirModes, self.dir_modes),
         ]
         .into_iter()
         .filter(|(_, steps)| !steps.is_empty())
         .map(|(kind, steps)| Phase { kind, steps })
         .collect()
     }
+}
+
+/// Whether a directory of mode `mode` keeps its owner from adding children
+/// to it, or from reaching them: it lacks `u+rwx`.
+fn locks_out(mode: u32) -> bool {
+    mode & 0o700 != 0o700
 }
 
 /// Deletes the file, symlink or directory `t`, leaving a tombstone with `vv`.
@@ -544,6 +583,84 @@ mod tests {
         let write = &phases[2].steps[0];
         assert!(matches!(&write.op, Op::WriteFile { vv: v, .. } if *v == vv(3, 2)));
         assert_eq!(write.source.as_ref().map(|e| e.vv.clone()), Some(vv(1, 2)));
+    }
+
+    /// Issue #13: a new directory that locks its owner out is made `u+rwx`,
+    /// with a vector that knows nothing yet, and gets its mode and vector
+    /// after its children, deepest first. A mode change that locks the owner
+    /// out comes last too; one that does not stays where it was.
+    #[test]
+    fn modes_that_lock_the_owner_out_come_last() {
+        use PhaseKind::*;
+        let (new, old) = (vv(2, 1), vv(1, 1));
+        let with_mode = |mode, vv: &VersionVector| Entry {
+            mode,
+            ..dir(vv.clone())
+        };
+        let a = [
+            ("ro", with_mode(0o555, &new)),
+            ("ro/sub", with_mode(0o500, &new)),
+            ("ro/sub/f", file(1, new.clone())),
+            ("w", with_mode(0o555, &new)),
+            ("w/f", file(2, new.clone())),
+            ("o", with_mode(0o750, &new)),
+        ];
+        let b = [("w", dir(old.clone())), ("o", dir(old.clone()))];
+        let (_, phases) = run(&a, &b);
+        let got = summary(&phases);
+        let got: Vec<_> = got
+            .iter()
+            .map(|(k, s, p, o, ab)| (*k, *s, p.as_str(), *o, *ab))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Creates, Side::B, "o", "setmeta", false),
+                (Creates, Side::B, "ro", "mkdir", true),
+                (Creates, Side::B, "ro/sub", "mkdir", true),
+                (Creates, Side::B, "w/f", "write", true),
+                (Creates, Side::B, "ro/sub/f", "write", true),
+                (DirModes, Side::B, "ro/sub", "setmeta", false),
+                (DirModes, Side::B, "ro", "setmeta", false),
+                (DirModes, Side::B, "w", "setmeta", false),
+            ]
+        );
+        let step = |kind, path: &str| {
+            phases
+                .iter()
+                .filter(|p| p.kind == kind)
+                .flat_map(|p| &p.steps)
+                .find(|s| s.path == rp(path))
+                .unwrap()
+        };
+        for (path, mode) in [("ro", 0o555), ("ro/sub", 0o500)] {
+            let unknown = VersionVector::new();
+            assert_eq!(
+                step(Creates, path).op,
+                Op::Mkdir {
+                    mode: mode | 0o700,
+                    mtime_ns: 0,
+                    vv: unknown.clone(),
+                }
+            );
+            let last = step(DirModes, path);
+            assert_eq!(
+                last.op,
+                Op::SetMeta {
+                    mode,
+                    mtime_ns: 0,
+                    vv: new.clone(),
+                }
+            );
+            assert_eq!(
+                last.pre,
+                Precondition::Matches {
+                    kind: Kind::Dir,
+                    vv: unknown,
+                }
+            );
+        }
+        assert_eq!(step(DirModes, "w").pre, Precondition::matching(&dir(old)));
     }
 
     #[test]

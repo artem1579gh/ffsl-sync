@@ -370,6 +370,8 @@ pub fn set_dir_mode(
     point("chmod.pinned");
     rustix::fs::fchmod(&pin, Mode::from_raw_mode(mode & MODE_MASK))
         .map_err(|e| t.err("chmod", e))?;
+    // The index records the new mode next: it must not revert (issue #13).
+    rustix::fs::fsync(&pin).map_err(|e| t.err("fsync", e))?;
     point("chmod.after_chmod");
     t.finish(&Fingerprint::of_fd(pin.as_fd())?)
 }
@@ -429,6 +431,7 @@ pub fn materialize(
     }
     rustix::fs::fchmod(&staged.pin, Mode::from_raw_mode(mode & MODE_MASK))
         .map_err(|e| t.err("chmod temp directory for", e))?;
+    rustix::fs::fsync(&staged.pin).map_err(|e| t.err("fsync temp directory for", e))?;
     staged.fp = Fingerprint::of_fd(staged.pin.as_fd())?;
     point("materialize.filled");
     rec.staged(&staged.fp)?;
@@ -437,6 +440,8 @@ pub fn materialize(
 
 /// Creates the objects of `tree` in the staged directory. Directory modes
 /// are set last, deepest first, so a read-only directory can still be filled.
+/// Each directory is fsynced then, so its entries are durable before the
+/// tree is exchanged in (the files were fsynced as they were staged).
 fn fill_tree(
     t: &Target<'_>,
     caps: &Caps,
@@ -502,6 +507,7 @@ fn fill_tree(
         .map_err(|e| t.err("open staged directory for", e))?;
         rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode & MODE_MASK))
             .map_err(|e| t.err("chmod staged directory for", e))?;
+        rustix::fs::fsync(&fd).map_err(|e| t.err("fsync staged directory for", e))?;
     }
     Ok(Ok(()))
 }
@@ -547,6 +553,7 @@ pub fn set_referent_mode(
     point("chmod.followed");
     rustix::fs::fchmod(&pin, Mode::from_raw_mode(mode & MODE_MASK))
         .map_err(|e| t.err("chmod", e))?;
+    rustix::fs::fsync(&pin).map_err(|e| t.err("fsync", e))?;
     point("chmod.after_chmod");
     t.check_parent()?;
     point("commit.verified");
@@ -684,17 +691,15 @@ impl<'a> Target<'a> {
     }
 
     fn sync_parent(&self) -> Result<()> {
-        let dir = rustix::fs::openat2(
-            self.parent(),
-            ".",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            RESOLVE,
-        )
-        .map_err(|e| self.err("open parent for fsync", e))?;
-        rustix::fs::fsync(&dir).map_err(|e| self.err("fsync parent of", e))?;
+        self.fsync_parent()?;
         point("commit.synced");
         Ok(())
+    }
+
+    /// fsyncs the parent: after a rename that puts user data back or aside
+    /// (undo, restore, conflict copy), which the index then takes as done.
+    fn fsync_parent(&self) -> Result<()> {
+        fsync_dir(self.parent()).map_err(|e| self.err("fsync parent of", e))
     }
 
     /// The parent must still resolve to the directory we committed in (§5.1).
@@ -714,6 +719,7 @@ impl<'a> Target<'a> {
     fn preserve(&self, replica: ReplicaId, from: &[u8], kind: FileKind) -> Result<RelPath> {
         let name = rename_to_conflict(self.parent(), from, self.name, kind, replica)
             .map_err(|e| self.err("keep conflict copy of", e))?;
+        self.fsync_parent()?;
         let dir = self.path.parent().unwrap_or_default();
         let conflict = dir.join(&name)?;
         tracing::warn!(path = %self.path, %conflict, "concurrent change kept as a conflict copy");
@@ -727,6 +733,13 @@ fn same_object(a: &Fingerprint, b: &Fingerprint) -> bool {
     a.same_file(b)
         && a.kind == b.kind
         && (a.kind == FileKind::Dir || (a.size == b.size && a.mtime_ns == b.mtime_ns))
+}
+
+/// [`same_object`] with the same permission bits: a user object a commit
+/// moved is unmodified. A chmod only bumps the ctime, which the rename bumps
+/// too, and the mode is synced (issue #13); a rename leaves it alone.
+fn unmodified(old: &Fingerprint, now: &Fingerprint) -> bool {
+    same_object(old, now) && old.mode == now.mode
 }
 
 /// §5.3 step 4(a), done early and cheaply so we don't stage content for a
@@ -1109,15 +1122,12 @@ fn remove_if(
 /// Removes the directory `parent/name` and everything in it: a tree of ours
 /// under a reserved name (only [`materialize`] stages one). Nothing beneath
 /// it is followed.
+///
+/// Each directory is made `u+rwx` first: the tree copies the peer's modes,
+/// and a read-only directory could not be emptied otherwise (issue #13).
 fn remove_tree(parent: BorrowedFd<'_>, name: &[u8]) -> Result<()> {
     let what = || format!("remove {}", name.escape_ascii());
-    let dir = match rustix::fs::openat2(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        RESOLVE,
-    ) {
+    let dir = match open_own_dir(parent, name) {
         Ok(dir) => dir,
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::io(what(), e.into())),
@@ -1150,6 +1160,45 @@ fn remove_tree(parent: BorrowedFd<'_>, name: &[u8]) -> Result<()> {
     match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
         Ok(()) | Err(Errno::NOENT) => Ok(()),
         Err(e) => Err(Error::io(what(), e.into())),
+    }
+}
+
+/// Opens our own directory `parent/name` (never through a symlink) after
+/// giving it mode 0700. One without read permission is pinned with `O_PATH`
+/// and changed through `/proc/self/fd`, which names exactly the pinned inode
+/// (`fchmod` refuses an `O_PATH` fd).
+fn open_own_dir(parent: BorrowedFd<'_>, name: &[u8]) -> std::result::Result<OwnedFd, Errno> {
+    let owner_rwx = Mode::from_raw_mode(0o700);
+    match rustix::fs::openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(dir) => {
+            rustix::fs::fchmod(&dir, owner_rwx)?;
+            Ok(dir)
+        }
+        Err(Errno::ACCESS) => {
+            let pin = rustix::fs::openat2(
+                parent,
+                name,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+                RESOLVE,
+            )?;
+            let proc_path = format!("/proc/self/fd/{}", pin.as_raw_fd());
+            rustix::fs::chmod(proc_path.as_str(), owner_rwx)?;
+            rustix::fs::openat2(
+                &pin,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                RESOLVE,
+            )
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1226,7 +1275,8 @@ fn stage_symlink<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, target: &[u8]) -> 
     Ok(staged)
 }
 
-/// `mkdirat(parent, tmp, 0700)`, then pins the directory and sets its mode.
+/// `mkdirat(parent, tmp, 0700)`, then pins the directory and sets its mode
+/// (fsynced, so the mode cannot revert once the index records it).
 fn stage_dir<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, mode: u32) -> Result<Staged<'p>> {
     let parent = t.parent();
     rec.begin()?;
@@ -1252,6 +1302,7 @@ fn stage_dir<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, mode: u32) -> Result<S
     };
     rustix::fs::fchmod(&staged.pin, Mode::from_raw_mode(mode & MODE_MASK))
         .map_err(|e| t.err("chmod temp directory for", e))?;
+    rustix::fs::fsync(&staged.pin).map_err(|e| t.err("fsync temp directory for", e))?;
     staged.fp = Fingerprint::of_fd(staged.pin.as_fd())?;
     Ok(staged)
 }
@@ -1418,8 +1469,9 @@ enum Verified {
     Gone,
 }
 
-/// §5.3 step 4(d): is the object at `tmp` still the old inode, unmodified?
-/// ctime is not compared, since the rename itself bumps it. Errors count as
+/// §5.3 step 4(d): is the object at `tmp` still the old inode, unmodified
+/// (its mode included)? ctime is not compared, since the rename itself bumps
+/// it. Errors count as
 /// "changed", so the caller undoes the rename. `rehash_point` is the hook
 /// point reached before a rehash.
 ///
@@ -1442,7 +1494,7 @@ fn verify_old(
             return Verified::Changed;
         }
     };
-    if !same_object(old, &out) {
+    if !unmodified(old, &out) {
         return Verified::Changed;
     }
     if old.kind == FileKind::File
@@ -1455,7 +1507,7 @@ fn verify_old(
             None => stable_read(t.parent(), tmp, &mut Discard),
         };
         match rehashed {
-            Ok((fp, h)) if same_object(old, &fp) && h == hash => {}
+            Ok((fp, h)) if unmodified(old, &fp) && h == hash => {}
             Ok(_) => return Verified::Changed,
             Err(e) => {
                 tracing::debug!(path = %t.path, error = %e, "rehash of replaced object failed");
@@ -1486,6 +1538,7 @@ fn undo(ctx: &Ctx<'_>, t: &Target<'_>, mut staged: Staged<'_>) -> Result<Outcome
     ) {
         Ok(()) => {
             point("replace.after_undo");
+            t.fsync_parent()?;
             match t.stat(&staged.name)? {
                 Some(back) if staged.is_ours(&back) => {
                     staged.live = true;
@@ -1514,8 +1567,12 @@ fn undo(ctx: &Ctx<'_>, t: &Target<'_>, mut staged: Staged<'_>) -> Result<Outcome
 /// kept under a conflict name instead; nothing is overwritten.
 fn restore(ctx: &Ctx<'_>, t: &Target<'_>, from: &[u8]) -> Result<Outcome> {
     match rustix::fs::renameat_with(t.parent(), from, t.parent(), t.name, RenameFlags::NOREPLACE) {
-        // NOENT: it vanished from our name, so there is nothing to restore.
-        Ok(()) | Err(Errno::NOENT) => Ok(Outcome::PreconditionFailed("changed during commit")),
+        Ok(()) => {
+            t.fsync_parent()?;
+            Ok(Outcome::PreconditionFailed("changed during commit"))
+        }
+        // It vanished from our name, so there is nothing to restore.
+        Err(Errno::NOENT) => Ok(Outcome::PreconditionFailed("changed during commit")),
         Err(Errno::EXIST) => {
             let kind = t.stat(from)?.map_or(FileKind::File, |f| f.kind);
             let conflict = t.preserve(ctx.replica, from, kind)?;
@@ -1705,6 +1762,18 @@ fn rename_to_conflict(
         }
     }
     Err(Errno::EXIST)
+}
+
+/// fsyncs the directory `dir`, which may be an `O_PATH` fd.
+fn fsync_dir(dir: BorrowedFd<'_>) -> std::result::Result<(), Errno> {
+    let fd = rustix::fs::openat2(
+        dir,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    )?;
+    rustix::fs::fsync(&fd)
 }
 
 fn sys_err(what: &str, e: Errno) -> Error {
@@ -1911,6 +1980,7 @@ fn put_back(
         rustix::fs::renameat_with(t.parent(), from, t.parent(), t.name, RenameFlags::EXCHANGE)
             .map_err(|e| t.err("undo exchange of", e))?;
         point("recover.undone");
+        t.fsync_parent()?;
         rep.restored += 1;
         return match t.stat(from)? {
             Some(back) if same_object(&n, &back) => remove_ours(t, from, intent, rep),
@@ -2473,6 +2543,10 @@ impl Pending {
                             Error::io(format!("keep conflict copy of {}", shown()), e.into())
                         })?;
                 let conflict = self.dir.join(&name)?;
+                // Its intent is forgotten next; the rename must not revert.
+                if let Err(e) = fsync_dir(parent) {
+                    tracing::warn!(%conflict, error = %e, "cannot fsync the directory of a conflict copy");
+                }
                 tracing::warn!(%conflict, "replaced file {why}; kept as a conflict copy");
                 report.conflicts.push(conflict);
                 Ok(true)
@@ -3858,6 +3932,74 @@ mod tests {
         assert_eq!(fs::symlink_metadata(fx.p("f")).unwrap().ino(), exp.fp.ino);
         assert!(q.is_empty());
         assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    /// Issue #13: a chmod between the check and the exchange (or the move
+    /// aside) only bumps the ctime, which the rename bumps too. It is a
+    /// change all the same: the mode is synced. A lease does not see it.
+    #[test]
+    fn chmod_before_the_exchange_is_kept() {
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().mode() & 0o7777;
+        for fx in [Fx::new(), Fx::leased()] {
+            let mut q = quarantine();
+            let exp = fx.user_file("f", b"old");
+            let user = fx.p("f");
+            let _g = hooks::once("replace.before_exchange", move || {
+                fs::set_permissions(&user, fs::Permissions::from_mode(0o600)).unwrap();
+            });
+            let out = replace(&fx, &mut q, "f", &exp, b"new").unwrap();
+            assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+            assert_eq!(fs::read(fx.p("f")).unwrap(), b"old");
+            assert_eq!(mode(&fx.p("f")), 0o600);
+
+            let exp = fx.user_file("g", b"old");
+            let user = fx.p("g");
+            let _g = hooks::once("delete.before_rename", move || {
+                fs::set_permissions(&user, fs::Permissions::from_mode(0o600)).unwrap();
+            });
+            let out = del(&fx, &mut q, "g", &exp).unwrap();
+            assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+            assert_eq!(mode(&fx.p("g")), 0o600);
+            assert!(q.is_empty());
+            assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+        }
+    }
+
+    /// Issue #13: a materialized copy of read-only directories (one not
+    /// even readable) that is not committed is removed all the same.
+    #[test]
+    fn undone_materialize_removes_read_only_directories() {
+        for fx in [Fx::new(), Fx::named()] {
+            symlink("elsewhere", fx.p("l")).unwrap();
+            let link = Expected::from(fx.root.stat(&rp("l")).unwrap());
+            let file = CopyNode::File {
+                meta: meta(),
+                hash: hash(b"data"),
+            };
+            let tree = [
+                (rp("sub"), CopyNode::Dir { mode: 0o555 }),
+                (rp("sub/f"), file.clone()),
+                (rp("locked"), CopyNode::Dir { mode: 0o311 }),
+                (rp("locked/f"), file),
+            ];
+            let mut open = |_: &RelPath| -> Result<Box<dyn Read>> {
+                Ok(Box::new(io::Cursor::new(b"data".to_vec())))
+            };
+            let user = fx.p("l");
+            let _g = hooks::once("replace.before_exchange", move || {
+                fs::remove_file(&user).unwrap();
+                symlink("user-target", &user).unwrap();
+            });
+            let mut q = quarantine();
+            let out = materialize(&fx.ctx(), &mut q, &rp("l"), &link, 0o555, &tree, &mut open);
+            assert_eq!(
+                out.unwrap(),
+                Outcome::PreconditionFailed("changed during commit")
+            );
+            assert_eq!(fs::read_link(fx.p("l")).unwrap(), Path::new("user-target"));
+            assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+            fs::remove_file(fx.p("l")).unwrap();
+        }
     }
 
     /// Same size, mtime restored: only the rehash catches it.

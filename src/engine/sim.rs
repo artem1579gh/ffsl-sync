@@ -324,7 +324,8 @@ fn arb_edit() -> impl Strategy<Value = Edit> {
         4 => any::<u8>().prop_map(What::Write),
         1 => (0u8..3).prop_map(What::Link),
         2 => Just(What::Mkdir),
-        1 => prop::sample::select(vec![0o700u32, 0o750, 0o755]).prop_map(What::Chmod),
+        // 0o555 and 0o500 lock the owner out: their mode comes last (issue #13).
+        1 => prop::sample::select(vec![0o700u32, 0o750, 0o755, 0o555, 0o500]).prop_map(What::Chmod),
         3 => Just(What::Remove),
     ];
     (path, what).prop_map(|(path, what)| Edit { path, what })

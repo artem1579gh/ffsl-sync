@@ -223,6 +223,37 @@ fn nested_directories(m: Mode) {
     assert!(p.a.ls().is_empty());
 }
 
+/// Issue #13: a read-only directory from the peer gets its children, and
+/// its mode once they are in. So does one made read-only in the same cycle
+/// as a new child arrives.
+fn read_only_directories(m: Mode) {
+    let mut p = pair(m);
+    p.a.write("ro/sub/f", "in a read-only tree");
+    p.a.write("ro/g", "g");
+    p.a.chmod("ro/sub", 0o555);
+    p.a.chmod("ro", 0o500);
+    p.a.write("w/old", "old");
+    p.sync();
+    p.a.write("w/new", "new");
+    p.a.chmod("w", 0o555);
+    p.sync();
+    p.assert_converged();
+    assert_eq!(p.b.read("ro/sub/f"), "in a read-only tree");
+    assert_eq!(p.b.read("w/new"), "new");
+    assert_eq!(
+        [p.b.mode("ro"), p.b.mode("ro/sub"), p.b.mode("w")],
+        [0o500, 0o555, 0o555]
+    );
+    let r = p.sync();
+    assert_eq!((r.applied, r.rounds), (0, 0));
+    // So the temp dirs can be removed.
+    for t in [&p.a, &p.b] {
+        for d in ["ro", "ro/sub", "w"] {
+            t.chmod(d, 0o755);
+        }
+    }
+}
+
 fn symlinks_under_links(m: Mode) {
     let mut p = pair(m);
     p.a.write("dir/file", "content");
@@ -512,6 +543,7 @@ both_modes! {
     directory_delete_vs_new_child_resurrects,
     type_changes,
     nested_directories,
+    read_only_directories,
     symlinks_under_links,
     recreated_symlink_with_same_target_is_not_a_change,
     symlinks_under_skip_are_left_alone,
