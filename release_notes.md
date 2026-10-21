@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.12 — 2026.10.21 10:03:14
+
+Fixes [issue #11](https://github.com/artem1579gh/files_sync/issues/11): a sync that replaced or deleted many files at once could run out of open files.
+
+- **What happened:** each file a sync replaced or deleted held open files until the end of the sync. With the usual limit of 1024 open files, a sync that changed more than a few hundred files (e.g. after a `git checkout`) failed every further change with `Too many open files`. Rarely, an old file could also be left behind as `.~fsync.old.*` until the next start, and keep its directory from being removed.
+- **Now:** `files_sync` raises its limit on open files to the hard limit (`ulimit -Hn`) when it starts. Replaced files in the same directory share what they hold open, and only so many of them are kept at a time. When that many are waiting, the sync removes the ones it can. On a filesystem without leases, it may pause for a fraction of a second until the oldest can go.
+- **Also:** while that many are waiting, a replaced file that a program still has open for writing becomes a conflict copy at once, not after a minute. The program's later writes go there, as before.
+
 ## 0.1.11 — 2026.10.21 09:37:54
 
 Fixes [issue #10](https://github.com/artem1579gh/files_sync/issues/10): a write by a program that kept a file open while a sync replaced or deleted it could be lost.
