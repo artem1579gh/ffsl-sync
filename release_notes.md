@@ -2,6 +2,17 @@
 
 All times are UTC.
 
+## 0.1.15 — 2026.10.21 12:44:00
+
+Fixes [issue #14](https://github.com/artem1579gh/files_sync/issues/14): six small problems, each rare, that could stop a path or a whole pair from syncing.
+
+- **Version counters:** a replica that sent counters at their limit (2^62, which only a damaged index or a misbehaving replica does) could make the other side write a counter it could no longer read, after which every sync failed with `bad index`. Now nothing above the limit is written: such a change fails with `version counter at its limit` for its path, and the index stays readable (see Troubleshooting in `docs/usage.md`).
+- **Deletions remembered for ever:** if one replica got a new replica ID, the other kept waiting for the old one and never dropped a remembered deletion (tombstone) again. Now it forgets the old ID at the next sync.
+- **Munged links:** in a replica with `munge_links`, a link whose target was exactly `/rsyncd-munged/` failed to sync on every run. Now it is synced as it is.
+- **Conflict copies of `.~fsync`:** the conflict copy of a file named exactly `.~fsync` got a name `files_sync` reserves for itself, so it was never made. Now it is `_.~fsync.sync-conflict-…`.
+- **Very deep trees:** each level of directories cost the scan stack space and an open file, so a very deep tree could crash `serve`, and paths longer than 4095 bytes were recorded but could not be synced. Now the scan uses no stack per level, and such a path is reported as `path longer than PATH_MAX; not synced`, with nothing beneath it synced.
+- **Running as root:** a file reached through a followed link was looked up a second time to be read, so a link swapped in between could make `files_sync` open a device file. Now it reads exactly the file it checked.
+
 ## 0.1.14 — 2026.10.21 12:13:13
 
 Fixes [issue #13](https://github.com/artem1579gh/files_sync/issues/13): a permission change made during a sync could be lost, read-only directories did not sync, and some changes were not saved to disk safely.
