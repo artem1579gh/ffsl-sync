@@ -191,11 +191,30 @@ impl SideArg {
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging();
+    raise_fd_limit();
     run_command(cli)?;
     if STDOUT_FAILED.load(Ordering::Relaxed) && !stdout_closed() {
         bail!("cannot write to stdout; output is incomplete");
     }
     Ok(())
+}
+
+/// Raises the soft limit on open files to the hard one (issue #11): the
+/// default soft limit (often 1024) is easily reached by a large cycle's
+/// quarantine, watches and connections. The quarantine sizes itself from
+/// the limit, so this runs before any replica is opened.
+fn raise_fd_limit() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    let mut limit = getrlimit(Resource::Nofile);
+    if limit.current == limit.maximum {
+        return;
+    }
+    let from = limit.current;
+    limit.current = limit.maximum;
+    match setrlimit(Resource::Nofile, limit) {
+        Ok(()) => tracing::debug!(?from, to = ?limit.maximum, "raised the open file limit"),
+        Err(e) => tracing::debug!(error = %e, "cannot raise the open file limit"),
+    }
 }
 
 fn run_command(cli: Cli) -> anyhow::Result<()> {

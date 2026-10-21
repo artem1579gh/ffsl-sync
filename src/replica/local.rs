@@ -246,6 +246,16 @@ impl LocalReplica {
         report
     }
 
+    /// Makes room in the quarantine before a commit or a replay
+    /// ([`Quarantine::make_room`], issue #11), and forgets the intents it
+    /// settles.
+    fn make_room(&mut self) {
+        let report = self.quarantine.make_room();
+        if let Err(e) = self.index.journal().forget(&report.finished) {
+            tracing::warn!(error = %e, "cannot forget settled quarantine intents");
+        }
+    }
+
     /// Removes what the trash has held for longer than `keep` (T31). A
     /// failure is logged; the next purge tries again.
     pub fn purge_trash(&mut self, keep: Duration) {
@@ -281,6 +291,7 @@ impl LocalReplica {
         let (mut done, mut kept, mut dirs) = (Vec::new(), Vec::new(), Vec::new());
         for (id, intent) in ids {
             if let Some(intent) = intent.filter(|_| !self.quarantine.holds(id)) {
+                self.make_room();
                 match self.replay_one(&snap, id, &intent) {
                     Ok(Some(dir)) => dirs.push(dir),
                     Ok(None) => {
@@ -1345,6 +1356,7 @@ impl Replica for LocalReplica {
         if path.is_root() {
             return Err(invalid(path, "cannot apply to the replica root"));
         }
+        self.make_room();
         // A change beneath a followed directory first turns that directory
         // into a real one; once per followed directory on the way.
         for _ in 0..path.depth() {

@@ -45,6 +45,7 @@
 
 use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jiff::ToSpan;
@@ -1956,12 +1957,19 @@ fn put_back(
 /// Each entry belongs to an intent in the journal, which outlives a crash
 /// (§5.8): the caller keeps it while [`Quarantine::holds`] it, and forgets it
 /// once a sweep reports it [`finished`](SweepReport::finished).
+///
+/// Each entry holds an fd on its old inode, and the entries of one directory
+/// share an fd on it (issue #11). A cycle can replace thousands of files
+/// before the next sweep, so the caller calls [`Quarantine::make_room`]
+/// before each commit, which keeps the entries below [`max`](Quarantine::set_max).
 pub struct Quarantine {
     replica: ReplicaId,
     grace: Duration,
     /// How long an entry a writer holds open waits before it becomes a
     /// conflict copy.
     writer_wait: Duration,
+    /// How many entries [`Quarantine::make_room`] lets wait.
+    max: usize,
     pending: Vec<Pending>,
     /// Where settled old inodes go instead of being unlinked (T31).
     trash: Option<Trash>,
@@ -1982,8 +1990,8 @@ struct Trash {
 /// One quarantined inode.
 struct Pending {
     /// The directory holding it (an `O_PATH` fd, so it is found even if the
-    /// directory is renamed).
-    parent: OwnedFd,
+    /// directory is renamed), shared by the entries in that directory.
+    parent: Arc<OwnedFd>,
     /// That directory's identity, for [`Quarantine::settle_dir`].
     dir_fp: Fingerprint,
     /// That directory's path when the entry was made, for conflict paths.
@@ -2027,6 +2035,17 @@ pub struct SweepReport {
     pub finished: Vec<IntentId>,
 }
 
+impl SweepReport {
+    /// Adds what another sweep did.
+    fn absorb(&mut self, other: SweepReport) {
+        self.removed += other.removed;
+        self.trashed += other.trashed;
+        self.conflicts.extend(other.conflicts);
+        self.dropped += other.dropped;
+        self.finished.extend(other.finished);
+    }
+}
+
 enum Verdict {
     Keep,
     /// Kept because a writer still has the file open.
@@ -2061,14 +2080,35 @@ impl Quarantine {
     /// How often an entry a writer has open is looked at again.
     pub const WRITER_POLL: Duration = Duration::from_secs(1);
 
+    /// How long [`Quarantine::make_room`] waits at most for entries to end
+    /// their grace periods.
+    pub const MAX_ROOM_WAIT: Duration = Duration::from_secs(10);
+
     pub fn new(replica: ReplicaId, grace: Duration) -> Quarantine {
         Quarantine {
             replica,
             grace,
             writer_wait: Self::DEFAULT_WRITER_WAIT,
+            max: Self::default_max(),
             pending: Vec::new(),
             trash: None,
         }
+    }
+
+    /// The default [`max`](Quarantine::set_max): an eighth of the soft limit
+    /// on open files (issue #11). An entry holds up to two fds (its old inode,
+    /// and its directory unless an entry there shares it), and a process may
+    /// run two replicas, which leaves half the limit for everything else.
+    fn default_max() -> usize {
+        let soft = rustix::process::getrlimit(rustix::process::Resource::Nofile)
+            .current
+            .unwrap_or(u64::MAX);
+        (soft / 8).clamp(16, 1 << 16) as usize
+    }
+
+    /// Changes how many entries [`Quarantine::make_room`] lets wait.
+    pub fn set_max(&mut self, max: usize) {
+        self.max = max.max(1);
     }
 
     /// From now on, moves settled old inodes into the trash of `root` (the
@@ -2138,6 +2178,11 @@ impl Quarantine {
         pin: OwnedFd,
         intent: IntentId,
     ) -> Result<()> {
+        // Whatever can fail comes before the rename, so the old inode never
+        // waits at its quarantine name without an entry (issue #11).
+        let parent = self.parent_fd(t)?;
+        let dir = t.path.parent().unwrap_or_default();
+        let replica_dir = replica_path(ctx.base, &dir)?;
         let name = if from == to {
             to.to_vec()
         } else {
@@ -2157,13 +2202,10 @@ impl Quarantine {
             }
         };
         self.pending.push(Pending {
-            parent: t
-                .parent
-                .try_clone()
-                .map_err(|e| Error::io("duplicate parent fd", e))?,
+            parent,
             dir_fp: t.parent_fp,
-            dir: t.path.parent().unwrap_or_default(),
-            replica_dir: replica_path(ctx.base, &t.path.parent().unwrap_or_default())?,
+            dir,
+            replica_dir,
             orig: t.name.to_vec(),
             name,
             fp: old,
@@ -2174,6 +2216,71 @@ impl Quarantine {
             leases: ctx.caps.leases,
         });
         Ok(())
+    }
+
+    /// An fd on the target's directory for a new entry: the one the entries
+    /// already there share, else a duplicate of the target's. An entry's fd
+    /// keeps its directory's inode, so its (dev, ino) names no other one.
+    fn parent_fd(&self, t: &Target<'_>) -> Result<Arc<OwnedFd>> {
+        let shared = self
+            .pending
+            .iter()
+            .rev()
+            .find(|p| p.dir_fp.same_file(&t.parent_fp));
+        if let Some(p) = shared {
+            return Ok(p.parent.clone());
+        }
+        let fd = t
+            .parent
+            .try_clone()
+            .map_err(|e| Error::io("duplicate parent fd", e))?;
+        Ok(Arc::new(fd))
+    }
+
+    /// Makes room for another entry while the quarantine holds `max` of
+    /// them (issue #11): sweeps it at once, and while it is still full, waits
+    /// for the next entry's grace period to end and sweeps again, for at most
+    /// [`MAX_ROOM_WAIT`](Quarantine::MAX_ROOM_WAIT). Under this pressure an
+    /// entry past its grace period that a writer has open becomes a conflict
+    /// copy at once rather than after `writer_wait`, so its writes are kept
+    /// there. Returns what the sweeps did; the caller forgets the
+    /// [`finished`](SweepReport::finished) intents as after [`Quarantine::sweep`].
+    pub fn make_room(&mut self) -> SweepReport {
+        let mut report = SweepReport::default();
+        let give_up = Instant::now() + Self::MAX_ROOM_WAIT;
+        while self.pending.len() >= self.max {
+            let now = Instant::now();
+            let grace = self.grace;
+            report.absorb(self.process(|p| {
+                Some(if now < p.since + grace {
+                    Due::Not
+                } else {
+                    Due::Now
+                })
+            }));
+            if self.pending.len() < self.max {
+                break;
+            }
+            let next = self
+                .pending
+                .iter()
+                .map(|p| p.since + grace)
+                .filter(|&end| end > now)
+                .min();
+            match next {
+                Some(next) if next <= give_up => {
+                    std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                }
+                _ => {
+                    tracing::warn!(
+                        entries = self.pending.len(),
+                        "quarantine is full and none of its entries can be settled now; going on"
+                    );
+                    break;
+                }
+            }
+        }
+        report
     }
 
     /// Processes every entry: one modified since the replace becomes a
@@ -3459,6 +3566,124 @@ mod tests {
         assert_eq!(q.sweep(), SweepReport::default());
         q.set_grace(Duration::ZERO);
         assert_eq!(q.sweep().removed, 1);
+        assert!(fx.leftovers().is_empty());
+    }
+
+    // ----- Issue #11: fds held by the quarantine ----------------------
+
+    /// The entries of one directory share one fd on it.
+    #[test]
+    fn quarantine_entries_share_their_directory_fd() {
+        let fx = Fx::new();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        fs::create_dir(fx.p("d")).unwrap();
+        fs::create_dir(fx.p("e")).unwrap();
+        for rel in ["d/1", "d/2", "e/1", "d/3"] {
+            let exp = fx.user_file(rel, b"old");
+            applied(replace(&fx, &mut q, rel, &exp, b"new").unwrap());
+        }
+        let exp = fx.user_file("d/4", b"gone");
+        assert_eq!(del(&fx, &mut q, "d/4", &exp).unwrap(), Outcome::Removed);
+        let p = &q.pending;
+        assert_eq!(p.len(), 5);
+        for i in [1, 3, 4] {
+            assert!(Arc::ptr_eq(&p[0].parent, &p[i].parent), "entry {i}");
+        }
+        assert!(!Arc::ptr_eq(&p[0].parent, &p[2].parent));
+        assert_eq!(Arc::strong_count(&p[0].parent), 4);
+        assert_eq!(Arc::strong_count(&p[2].parent), 1);
+    }
+
+    /// A full quarantine without leases waits for its oldest entry's grace
+    /// period, then unlinks what is due.
+    #[test]
+    fn make_room_waits_for_the_grace_period() {
+        let fx = Fx::new();
+        let grace = Duration::from_millis(300);
+        let mut q = Quarantine::new(REPLICA, grace);
+        q.set_max(2);
+        assert_eq!(q.make_room(), SweepReport::default());
+        let t0 = Instant::now();
+        for rel in ["f", "g"] {
+            let exp = fx.user_file(rel, b"old");
+            applied(replace(&fx, &mut q, rel, &exp, b"new").unwrap());
+        }
+        let report = q.make_room();
+        assert!(t0.elapsed() >= grace);
+        // Room for one more: the first entry at least is gone.
+        assert!(report.removed >= 1, "{report:?}");
+        assert_eq!(report.finished.len(), report.removed);
+        assert_eq!(q.len(), 2 - report.removed);
+        assert_eq!(fx.leftovers().len(), q.len());
+        std::thread::sleep(grace);
+        q.sweep();
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// With leases, a full quarantine is emptied at once, before the grace
+    /// period; only room for one more entry is made.
+    #[test]
+    fn make_room_unlinks_leased_entries_at_once() {
+        let fx = Fx::leased();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        q.set_max(3);
+        for rel in ["f", "g"] {
+            let exp = fx.user_file(rel, b"old");
+            applied(replace(&fx, &mut q, rel, &exp, b"new").unwrap());
+        }
+        assert_eq!(q.make_room(), SweepReport::default());
+        assert_eq!(q.len(), 2);
+        let exp = fx.user_file("h", b"old");
+        applied(replace(&fx, &mut q, "h", &exp, b"new").unwrap());
+        let t0 = Instant::now();
+        assert_eq!(q.make_room().removed, 3);
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// Nothing to settle within `MAX_ROOM_WAIT`: it goes on at once, the
+    /// entries left as they were.
+    #[test]
+    fn make_room_does_not_wait_beyond_its_limit() {
+        let fx = Fx::new();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        q.set_max(1);
+        let exp = fx.user_file("f", b"old");
+        applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
+        let t0 = Instant::now();
+        assert_eq!(q.make_room(), SweepReport::default());
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert_eq!(q.len(), 1);
+        assert_eq!(fx.leftovers().len(), 1);
+    }
+
+    /// Under pressure, an entry past its grace period that a writer has open
+    /// becomes a conflict copy at once, which takes the writer's later
+    /// writes; one modified is a conflict copy as ever.
+    #[test]
+    fn make_room_keeps_a_writers_file_as_a_conflict_copy() {
+        let fx = Fx::leased();
+        let mut q = quarantine();
+        q.set_max(1);
+        let exp = fx.user_file("f.txt", b"old");
+        let mut writer = fs::File::options()
+            .append(true)
+            .open(fx.p("f.txt"))
+            .unwrap();
+        applied(replace(&fx, &mut q, "f.txt", &exp, b"new").unwrap());
+        let report = q.make_room();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        assert_eq!(report.finished.len(), 1);
+        let name = report.conflicts[0]
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        writer.write_all(b" late").unwrap();
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late");
+        assert_eq!(fs::read(fx.p("f.txt")).unwrap(), b"new");
+        assert!(q.is_empty());
         assert!(fx.leftovers().is_empty());
     }
 

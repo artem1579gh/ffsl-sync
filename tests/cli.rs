@@ -369,6 +369,58 @@ fn sync_once_syncs_two_directories() {
     }
 }
 
+/// Issue #11: every replaced file waits in quarantine until the cycle ends,
+/// holding fds. Under a low limit on open files, a cycle that replaces many
+/// files used to fail with EMFILE after a few dozen commits.
+#[test]
+fn a_large_cycle_stays_within_the_open_file_limit() {
+    use std::os::unix::process::CommandExt;
+    const LIMIT: u64 = 256;
+    const FILES: usize = 600;
+
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    let file = |i: usize| format!("d{}/f{i}", i % 3);
+    for d in 0..3 {
+        std::fs::create_dir(a.path().join(format!("d{d}"))).unwrap();
+    }
+    for i in 0..FILES {
+        std::fs::write(a.path().join(file(i)), "old").unwrap();
+    }
+    ok(state.path(), &["sync", "--once", "p"]);
+    for i in 0..FILES {
+        std::fs::write(a.path().join(file(i)), "new").unwrap();
+    }
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_files_sync"));
+    cmd.args(["sync", "--once", "p"])
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("RUST_LOG");
+    let limit = rustix::process::Rlimit {
+        current: Some(LIMIT),
+        maximum: Some(LIMIT),
+    };
+    // SAFETY: setrlimit is a plain system call, safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)
+                .map_err(std::io::Error::from)
+        });
+    }
+    let out = cmd.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("Too many open files"), "{stderr}");
+    for i in 0..FILES {
+        assert_eq!(std::fs::read(b.path().join(file(i))).unwrap(), b"new");
+    }
+    for root in [&a, &b] {
+        for d in 0..3 {
+            assert_eq!(names(&root.path().join(format!("d{d}"))).len(), FILES / 3);
+        }
+    }
+}
+
 /// A local pair sends whole files, so its summary never mentions deltas
 /// (T28), even for a replaced file above the delta threshold.
 #[test]
