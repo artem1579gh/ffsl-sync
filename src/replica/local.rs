@@ -41,7 +41,8 @@ use crate::fs::commit::{
 use crate::fs::layout;
 use crate::fs::root::{follow_at, path_err, reopen_file};
 use crate::fs::{
-    FileKind, Fingerprint, PinnedFile, Recheck, RelPath, Root, StableReader, open_checked, tmpname,
+    FileKind, Fingerprint, PinnedFile, Recheck, RelPath, Root, StableReader, hooks, open_checked,
+    tmpname,
 };
 use crate::index::{
     Entry, IndexStore, Intent, IntentId, Kind, LinkInfo, LocalMeta, PeerState, ReadTxn,
@@ -479,20 +480,40 @@ impl LocalReplica {
         }
     }
 
+    /// Whether this replica's scans can index entries through a link
+    /// (`via_link`): the symlink policies that follow, and `-K` adoption
+    /// (design §4.3, §4.3.1).
+    fn may_follow(&self) -> bool {
+        self.config.keep_dirlinks
+            || matches!(
+                self.config.symlinks,
+                SymlinkPolicy::CopyLinks
+                    | SymlinkPolicy::CopyUnsafeLinks
+                    | SymlinkPolicy::CopyDirlinks
+            )
+    }
+
     /// Hands the followed (and adopted) links, with their referents, to the
     /// watcher (design §4.5), unless there are none now and there were none
     /// the last time. Links that cannot be opened now are left out until the
-    /// next time.
+    /// next time. Without a config that follows links and with none handed
+    /// over the last time, the index is not read at all (issue #15): entries
+    /// a config that followed links left behind are not followed again, and
+    /// the next scan of each indexes it anew.
     fn watch_followed(&mut self) {
         let Some(watcher) = &self.watcher else {
             return;
         };
+        if self.followed == 0 && !self.may_follow() {
+            return;
+        }
         let disk = Disk {
             root: &self.root,
             config: &self.config,
             stale: &self.stale,
         };
         let found = (|| -> Result<Vec<Followed>> {
+            hooks::point("watch.list_followed");
             let snap = self.index.read()?;
             let mut links = Vec::new();
             for (path, e) in snap.iter_prefix(&RelPath::root())? {
@@ -3750,6 +3771,119 @@ mod tests {
         let hint = again.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(hint, Hint::Paths(vec![RelPath::new("h").unwrap()]));
         assert!(hints.is_empty());
+    }
+
+    /// The followed links a [`FollowLog`] was handed, in order.
+    type Follows = Arc<Mutex<Vec<Vec<RelPath>>>>;
+
+    /// An event source that reports nothing and records the followed links
+    /// it is handed.
+    struct FollowLog(Follows);
+
+    impl EventSource for FollowLog {
+        fn wait(&mut self, timeout: Duration) -> Result<Vec<crate::watch::Event>> {
+            std::thread::sleep(timeout);
+            Ok(Vec::new())
+        }
+
+        fn follow(&mut self, links: Vec<Followed>) {
+            let paths = links.into_iter().map(|l| l.path).collect();
+            self.0.lock().unwrap().push(paths);
+        }
+    }
+
+    /// Starts `fx`'s watcher on a [`FollowLog`]; whether that read the
+    /// index for followed links.
+    fn watch_follows(fx: &mut Fx) -> (Follows, bool) {
+        let log = Follows::default();
+        fx.r.set_event_source(Box::new(FollowLog(Arc::clone(&log))));
+        let listed = lists_followed(|| assert!(fx.r.watch().is_some()));
+        (log, listed)
+    }
+
+    /// Whether `f` read the index for followed links.
+    fn lists_followed(f: impl FnOnce()) -> bool {
+        hooks::start_trace();
+        f();
+        hooks::take_trace().contains(&"watch.list_followed")
+    }
+
+    /// Waits until the watcher was last handed exactly `want`.
+    fn wait_follows(log: &Follows, want: &[&str]) {
+        let want: Vec<RelPath> = want.iter().map(|p| rp(p)).collect();
+        let until = Instant::now() + Duration::from_secs(3);
+        while log.lock().unwrap().last() != Some(&want) {
+            assert!(
+                Instant::now() < until,
+                "{:?}, want {want:?}",
+                log.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Issue #15, item 2: a scan that changed something reads the whole
+    /// index for followed links only if the config can produce them.
+    #[test]
+    fn followed_links_are_listed_only_when_there_can_be_any() {
+        use SymlinkPolicy::*;
+        for (symlinks, keep_dirlinks, may_follow) in [
+            (Skip, false, false),
+            (Links, false, false),
+            (SafeLinks, false, false),
+            (CopyLinks, false, true),
+            (CopyUnsafeLinks, false, true),
+            (CopyDirlinks, false, true),
+            (Links, true, true),
+        ] {
+            let case = format!("{symlinks:?}, -K {keep_dirlinks}");
+            let mut fx = Fx::with(symlinks, false);
+            fx.r.config.keep_dirlinks = keep_dirlinks;
+            let (log, listed) = watch_follows(&mut fx);
+            assert_eq!(listed, may_follow, "{case}: watch");
+            user_file(&fx, "f", b"x");
+            let mut stats = None;
+            let listed = lists_followed(|| stats = Some(fx.scan()));
+            assert!(stats.unwrap().changed > 0, "{case}");
+            assert_eq!(listed, may_follow, "{case}: scan");
+            // There were none to hand over.
+            assert!(log.lock().unwrap().is_empty(), "{case}");
+        }
+    }
+
+    /// Followed (`-L`, `-k`) and adopted (`-K`) links are handed to the
+    /// watcher; once the config stops following them, the next scan takes
+    /// them away again, and later scans no longer read the index for them.
+    #[test]
+    fn a_link_that_stops_being_followed_is_unwatched() {
+        use SymlinkPolicy::*;
+        for (symlinks, keep_dirlinks) in [(CopyLinks, false), (CopyDirlinks, false), (Links, true)]
+        {
+            let case = format!("{symlinks:?}, -K {keep_dirlinks}");
+            let mut fx = Fx::with(symlinks, false);
+            fx.r.config.keep_dirlinks = keep_dirlinks;
+            fs::create_dir(fx.p("d")).unwrap();
+            user_file(&fx, "d/x", b"x");
+            symlink("d", fx.p("l")).unwrap();
+            let (log, _) = watch_follows(&mut fx);
+            fx.scan();
+            if keep_dirlinks {
+                assert!(fx.r.adopt(&rp("l")).unwrap(), "{case}");
+            }
+            assert!(fx.get("l").local.via_link.is_some(), "{case}");
+            wait_follows(&log, &["l"]);
+
+            fx.r.config.symlinks = Links;
+            fx.r.config.keep_dirlinks = false;
+            let listed = lists_followed(|| assert!(fx.scan().changed > 0, "{case}"));
+            assert!(listed, "{case}: the watched link must be dropped");
+            assert!(matches!(fx.get("l").kind, Kind::Symlink { .. }), "{case}");
+            wait_follows(&log, &[]);
+
+            user_file(&fx, "f", b"f");
+            let listed = lists_followed(|| assert!(fx.scan().changed > 0, "{case}"));
+            assert!(!listed, "{case}: nothing left to follow");
+        }
     }
 
     // ---- block-level delta transfer (§7.1) ----
