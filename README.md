@@ -94,6 +94,7 @@ cargo test                                        # unit + integration
 cargo test --features hooks                       # adds the race-injection and crash suites
 cargo clippy --all-targets -- -D warnings
 cargo test --release --test stress -- --ignored   # long concurrent stress test
+cargo test --release --test scale -- --ignored --nocapture --test-threads=1   # scale benchmark
 ```
 
 Development is organised as a sequence of self-contained tasks in [`claude/tasks.md`](claude/tasks.md).

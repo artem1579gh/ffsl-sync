@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::engine::conflict::{ConflictCopy, log_resolutions};
@@ -273,7 +274,7 @@ struct Cycle<'r> {
     adopt_asked: BTreeSet<(Side, RelPath)>,
     /// The snapshots the last reconcile compared: the state the cycle ends
     /// in, since nothing ran after it.
-    last: Option<(Snapshot, Snapshot)>,
+    last: Option<(Arc<Snapshot>, Arc<Snapshot>)>,
     /// See [`Engine::delta_min_size`].
     delta_min_size: u64,
     /// See [`Engine::max_delete_percent`].
@@ -347,19 +348,26 @@ impl Cycle<'_> {
 
     /// Reconciles the current indexes. Rescans go to `dirty`; returns the
     /// actions that have steps, without paths that already failed.
+    ///
+    /// The replicas keep their snapshots across rounds and cycles and read
+    /// only what changed (issue #15). A snapshot is dropped before the next
+    /// one is asked for: one still held would be copied.
     fn reconcile(&mut self) -> Result<Vec<Action>> {
-        let mut a = Snapshot::new(self.a.id(), self.a.changes_since(0)?);
-        let mut b = Snapshot::new(self.b.id(), self.b.changes_since(0)?);
+        self.last = None;
+        let mut a = self.a.snapshot()?;
+        let mut b = self.b.snapshot()?;
         let [adopted_a, adopted_b] = self.adopt_dirlinks(&a, &b)?;
         if adopted_a {
-            a = Snapshot::new(self.a.id(), self.a.changes_since(0)?);
+            drop(a);
+            a = self.a.snapshot()?;
         }
         if adopted_b {
-            b = Snapshot::new(self.b.id(), self.b.changes_since(0)?);
+            drop(b);
+            b = self.b.snapshot()?;
         }
         let now = jiff::Zoned::now().datetime();
         let mut todo = Vec::new();
-        for action in reconcile(&a, &b, now) {
+        for action in reconcile(&*a, &*b, now) {
             let path = &action.path;
             if self.has_failed(path) {
                 continue;

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Receiver;
 use ffsl_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
-use ffsl_sync::engine::{Engine, Side, SyncReport};
+use ffsl_sync::engine::{CacheStats, Engine, Side, Snapshot, SyncReport};
 use ffsl_sync::fs::{FileKind, RelPath, is_reserved, is_root_marker};
 use ffsl_sync::index::{Entry, Kind, PeerState, VersionVector};
 use ffsl_sync::replica::proto::PROTOCOL_VERSION;
@@ -247,6 +247,15 @@ impl TestReplica {
         self.local_mut().sweep_quarantine();
     }
 
+    /// How the engine's side of this replica kept its index snapshot: the
+    /// `LocalReplica`'s cache, or the client's mirror of a served one.
+    pub fn snapshot_stats(&self) -> CacheStats {
+        match self {
+            TestReplica::Local(r) => r.snapshot_stats(),
+            TestReplica::Remote { client, .. } => client.snapshot_stats(),
+        }
+    }
+
     fn get(&self) -> &dyn Replica {
         match self {
             TestReplica::Local(r) => r,
@@ -273,6 +282,10 @@ impl Replica for TestReplica {
 
     fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.get().changes_since(seq)
+    }
+
+    fn snapshot(&self) -> ffsl_sync::Result<Arc<Snapshot>> {
+        self.get().snapshot()
     }
 
     fn open_read(
@@ -770,6 +783,10 @@ impl Replica for Racing<'_> {
 
     fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.inner.changes_since(seq)
+    }
+
+    fn snapshot(&self) -> ffsl_sync::Result<Arc<Snapshot>> {
+        self.inner.snapshot()
     }
 
     fn open_read(

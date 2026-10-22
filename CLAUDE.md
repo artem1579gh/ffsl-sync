@@ -22,6 +22,7 @@ cargo test                                   # unit + integration
 cargo test --features hooks                  # includes race-injection suites (tests/attack.rs, crash.rs)
 cargo clippy --all-targets -- -D warnings
 cargo test --release --test stress -- --ignored   # long concurrent stress test
+cargo test --release --test scale -- --ignored --nocapture --test-threads=1   # scale benchmark (prints timings)
 cargo build --release                             # binary for manual checks
 ```
 

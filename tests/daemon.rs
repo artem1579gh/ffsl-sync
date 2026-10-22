@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use ffsl_sync::config::{ReplicaId, SymlinkPolicy};
 use ffsl_sync::daemon::{CycleReport, Daemon, DaemonStats};
+use ffsl_sync::engine::Snapshot;
 use ffsl_sync::fs::{RelPath, is_reserved};
 use ffsl_sync::index::{Entry, PeerState, VersionVector};
 use ffsl_sync::replica::{
@@ -373,6 +374,10 @@ impl Replica for Flaky {
 
     fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.inner.changes_since(seq)
+    }
+
+    fn snapshot(&self) -> ffsl_sync::Result<Arc<Snapshot>> {
+        self.inner.snapshot()
     }
 
     fn open_read(

@@ -926,27 +926,38 @@ impl Walk<'_> {
     }
 
     /// Queues tombstones for indexed paths in the scanned regions that were
-    /// not found (and are not protected).
+    /// not found (and are not protected). Streams each region from the index
+    /// (issue #15), and decodes only the entries not seen.
     fn tombstones(&mut self) -> Result<()> {
-        for region in std::mem::take(&mut self.regions) {
-            for (path, e) in self.snap.iter_prefix(&region)? {
-                if e.is_tombstone()
-                    || self.seen.contains(path.as_bytes())
-                    || prefixes(&path).any(|pre| self.protected.contains(pre))
-                {
-                    continue;
-                }
-                self.pending.push(Update {
-                    path,
-                    base: Some(e.seq),
-                    change: Change::New {
-                        kind: Kind::Tombstone,
-                        mode: 0,
-                        mtime_ns: 0,
-                        local: LocalMeta::default(),
-                    },
-                });
-            }
+        let regions = std::mem::take(&mut self.regions);
+        let Walk {
+            snap,
+            seen,
+            protected,
+            pending,
+            ..
+        } = self;
+        for region in regions {
+            snap.for_each_prefix(
+                &region,
+                |key| !seen.contains(key),
+                |path, e| {
+                    if e.is_tombstone() || prefixes(&path).any(|pre| protected.contains(pre)) {
+                        return Ok(());
+                    }
+                    pending.push(Update {
+                        path,
+                        base: Some(e.seq),
+                        change: Change::New {
+                            kind: Kind::Tombstone,
+                            mode: 0,
+                            mtime_ns: 0,
+                            local: LocalMeta::default(),
+                        },
+                    });
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     }

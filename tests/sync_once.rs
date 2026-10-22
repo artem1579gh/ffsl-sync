@@ -533,6 +533,57 @@ fn small_or_partial_deletions_apply(m: Mode) {
     p.assert_converged();
 }
 
+/// After the first round of a process, a cycle reads into the engine's
+/// index snapshots only the entries that changed, and never copies a whole
+/// snapshot (issue #15). In remote mode, the client's mirror of each served
+/// index.
+fn index_snapshots_are_kept_across_cycles(m: Mode) {
+    let mut p = pair(m);
+    for i in 0..40 {
+        p.a.write(&format!("d/f{i:02}"), format!("{i}"));
+        p.b.write(&format!("e/f{i:02}"), format!("{i}"));
+    }
+    p.sync();
+    let stats = |p: &Pair| [p.a.replica.snapshot_stats(), p.b.replica.snapshot_stats()];
+    let first = stats(&p);
+    // Each entry was read once: the first round read each index whole (its
+    // own directory and 40 files), the second what the first wrote there.
+    assert!(first.iter().all(|s| s.read == 82), "{first:?}");
+
+    // Nothing changed: nothing read.
+    let r = p.sync();
+    assert_eq!(r.applied, 0);
+    assert_eq!(stats(&p), first);
+
+    // One file changed on A: its entry on each side (A's scan, B's write).
+    p.a.write("d/f07", "changed");
+    let r = p.sync();
+    assert_eq!(r.applied, 1);
+    let one = stats(&p);
+    for (before, after) in first.iter().zip(&one) {
+        assert_eq!(after.read - before.read, 1, "{first:?} -> {one:?}");
+    }
+
+    // A delete, its tombstone collected at the end of the cycle (the next
+    // round leaves the row out); a conflict.
+    let mut p = p.tombstone_retention(std::time::Duration::ZERO);
+    p.a.rm("d/f01");
+    p.a.write("e/f02", "a's edit");
+    p.b.write("e/f02", "b's edit");
+    let r = p.sync();
+    assert_eq!(r.conflicts.len(), 1);
+    p.sync();
+    assert!(p.a.entry("d/f01").is_none() && p.b.entry("d/f01").is_none());
+    p.assert_converged();
+    let end = stats(&p);
+    assert!(
+        end.iter().zip(&one).all(|(e, o)| e.read - o.read <= 10),
+        "{one:?} -> {end:?}"
+    );
+    // The engine let go of each snapshot before asking for the next one.
+    assert!(end.iter().all(|s| s.copies == 0), "{end:?}");
+}
+
 both_modes! {
     create_on_each_side,
     modify_on_each_side,
@@ -555,4 +606,5 @@ both_modes! {
     concurrent_tombstones_are_collected,
     mass_deletion_is_held_back,
     small_or_partial_deletions_apply,
+    index_snapshots_are_kept_across_cycles,
 }

@@ -79,17 +79,22 @@ impl ReplicaStatus {
     ) -> Result<ReplicaStatus> {
         let mut st = ReplicaStatus::default();
         let txn = index.read()?;
-        for (path, entry) in txn.iter_prefix(&RelPath::root())? {
-            st.entries += 1;
-            match entry.kind {
-                Kind::Tombstone => st.tombstones += 1,
-                Kind::Unmanaged(_) => {}
-                _ if path.name().is_some_and(is_conflict_name) => {
-                    st.conflicts.push(path.to_string());
+        txn.for_each_prefix(
+            &RelPath::root(),
+            |_| true,
+            |path, entry| {
+                st.entries += 1;
+                match entry.kind {
+                    Kind::Tombstone => st.tombstones += 1,
+                    Kind::Unmanaged(_) => {}
+                    _ if path.name().is_some_and(is_conflict_name) => {
+                        st.conflicts.push(path.to_string());
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        }
+                Ok(())
+            },
+        )?;
         st.last_sync_ns = txn
             .peers()?
             .into_iter()

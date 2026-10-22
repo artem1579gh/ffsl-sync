@@ -370,6 +370,18 @@ impl ReadTxn {
         iter_prefix(&self.entries()?, prefix)
     }
 
+    /// [`ReadTxn::iter_prefix`] without collecting: calls `f` on each entry
+    /// as it is read, in key order, and stops at its first error. An entry
+    /// whose key `wanted` refuses is not even decoded.
+    pub fn for_each_prefix(
+        &self,
+        prefix: &RelPath,
+        wanted: impl FnMut(&[u8]) -> bool,
+        f: impl FnMut(RelPath, Entry) -> Result<()>,
+    ) -> Result<()> {
+        for_each_prefix(&self.entries()?, prefix, wanted, f)
+    }
+
     /// Number of entries (tombstones included).
     pub fn len(&self) -> Result<u64> {
         self.entries()?.len().map_err(dberr)
@@ -743,33 +755,51 @@ fn iter_prefix(
     prefix: &RelPath,
 ) -> Result<Vec<(RelPath, Entry)>> {
     let mut out = Vec::new();
-    let push_range = |out: &mut Vec<_>, range: redb::Range<'_, &'static [u8], &'static [u8]>| {
+    for_each_prefix(
+        entries,
+        prefix,
+        |_| true,
+        |path, entry| {
+            out.push((path, entry));
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+fn for_each_prefix(
+    entries: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    prefix: &RelPath,
+    mut wanted: impl FnMut(&[u8]) -> bool,
+    mut f: impl FnMut(RelPath, Entry) -> Result<()>,
+) -> Result<()> {
+    let mut each = |range: redb::Range<'_, &'static [u8], &'static [u8]>| {
         for row in range {
             let (k, v) = row.map_err(dberr)?;
-            out.push(decode(k.value(), v.value())?);
+            if wanted(k.value()) {
+                let (path, entry) = decode(k.value(), v.value())?;
+                f(path, entry)?;
+            }
         }
         Ok::<_, Error>(())
     };
     if prefix.is_root() {
-        push_range(&mut out, entries.iter().map_err(dberr)?)?;
-        return Ok(out);
+        return each(entries.iter().map_err(dberr)?);
     }
-    if let Some(e) = get_entry(entries, prefix)? {
-        out.push((prefix.clone(), e));
-    }
-    // Descendants are exactly the keys in ["prefix/", "prefix0"): '0' follows
-    // '/' in byte order. A sibling like "prefix.txt" sorts before them.
-    let mut lo = prefix.as_bytes().to_vec();
+    // The prefix itself, then its descendants: exactly the keys in
+    // ["prefix/", "prefix0"), since '0' follows '/' in byte order. A sibling
+    // like "prefix.txt" sorts before them.
+    let key = prefix.as_bytes();
+    each(entries.range::<&[u8]>(key..=key).map_err(dberr)?)?;
+    let mut lo = key.to_vec();
     lo.push(b'/');
-    let mut hi = prefix.as_bytes().to_vec();
+    let mut hi = key.to_vec();
     hi.push(b'/' + 1);
-    push_range(
-        &mut out,
+    each(
         entries
             .range::<&[u8]>(lo.as_slice()..hi.as_slice())
             .map_err(dberr)?,
-    )?;
-    Ok(out)
+    )
 }
 
 #[cfg(test)]

@@ -16,8 +16,9 @@
 //!
 //! **Index exchange.** The replica mirrors the server's index (wire form) and
 //! asks only for the entries put since the last seq it saw
-//! (`ChangesSince { seq }`); [`Replica::changes_since`] is answered from the
-//! mirror. Entries only disappear by tombstone collection, which goes
+//! (`ChangesSince { seq }`); [`Replica::snapshot`] hands out the mirror
+//! itself (shared, not copied), and [`Replica::changes_since`] is answered
+//! from it. Entries only disappear by tombstone collection, which goes
 //! through [`Replica::record_sync`] and is applied to the mirror. The mirror
 //! starts over on each new connection (the server's index may have been
 //! replaced meanwhile).
@@ -27,7 +28,6 @@
 //! lost, the thread reconnects (with backoff) and sends a
 //! [`Hint::FullRescan`], since changes may have been missed meanwhile.
 
-use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -44,6 +44,7 @@ use super::proto::{
 };
 use super::{BLOCK_SIZE, Blocks, ContentReader, Delta, Op, Outcome, Precondition, Replica};
 use crate::config::{ReplicaConfig, ReplicaId};
+use crate::engine::{CacheStats, IndexView, Snapshot, SnapshotCache};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::index::{Entry, Kind, PeerState, VersionVector};
@@ -301,15 +302,33 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The server's index as far as we have seen it.
-#[derive(Default)]
 struct Mirror {
     /// The connection it was built over.
     session: u64,
-    /// The highest seq received.
-    seen: u64,
-    entries: BTreeMap<RelPath, Entry>,
-    /// Entries received over the wire in all (for tests and logs).
-    received: u64,
+    /// Its `read` counts the entries received over the wire in all.
+    cache: SnapshotCache,
+}
+
+/// Asks the server for the entries put since `seq` and hands each batch to
+/// `f`. The outer error is the connection's, the inner one the server's.
+fn fetch(
+    conn: &mut Conn,
+    seq: u64,
+    mut f: impl FnMut(Vec<(RelPath, Entry)>),
+) -> Result<Result<()>> {
+    write_frame(&mut conn.tls, &Request::ChangesSince { seq })?;
+    loop {
+        match recv(&mut conn.tls)? {
+            Response::Changes { entries, more } => {
+                f(entries);
+                if !more {
+                    return Ok(Ok(()));
+                }
+            }
+            Response::Error(e) => return Ok(Err(e.into())),
+            other => return Err(unexpected(&other)),
+        }
+    }
 }
 
 /// The hint side of [`RemoteReplica::watch`].
@@ -396,7 +415,10 @@ impl RemoteReplica {
         link.put(conn);
         Ok(RemoteReplica {
             link,
-            mirror: Mutex::new(Mirror::default()),
+            mirror: Mutex::new(Mirror {
+                session: 0,
+                cache: SnapshotCache::new(remote),
+            }),
             watching: None,
         })
     }
@@ -409,7 +431,32 @@ impl RemoteReplica {
     /// Index entries received from the server so far (each `ChangesSince`
     /// sends only what changed since the last one).
     pub fn entries_received(&self) -> u64 {
-        lock(&self.mirror).received
+        self.snapshot_stats().read
+    }
+
+    /// What keeping the mirror up to date took so far ([`CacheStats::read`]
+    /// is [`RemoteReplica::entries_received`]).
+    pub fn snapshot_stats(&self) -> CacheStats {
+        lock(&self.mirror).cache.stats()
+    }
+
+    /// Brings the mirror up to date with the server's index (a new session
+    /// starts it over), then runs `f` on it over the same connection (its
+    /// outer error is the connection's, as for [`RemoteReplica::call`]).
+    fn refresh<T>(&self, f: impl FnOnce(&mut Conn, &Mirror) -> Result<Result<T>>) -> Result<T> {
+        let mut guard = lock(&self.mirror);
+        let mirror = &mut *guard;
+        self.call(|conn| {
+            if conn.session != mirror.session {
+                mirror.session = conn.session;
+                mirror.cache.reset();
+            }
+            let cache = &mut mirror.cache;
+            if let Err(e) = fetch(conn, cache.seen(), |entries| cache.update(entries))? {
+                return Ok(Err(e));
+            }
+            f(conn, mirror)
+        })
     }
 
     /// Connections opened so far.
@@ -514,42 +561,31 @@ impl Replica for RemoteReplica {
     }
 
     fn changes_since(&self, seq: u64) -> Result<Vec<(RelPath, Entry)>> {
-        let mut guard = lock(&self.mirror);
-        let mirror = &mut *guard;
-        self.call(|conn| {
-            if conn.session != mirror.session {
-                *mirror = Mirror {
-                    session: conn.session,
-                    received: mirror.received,
-                    ..Mirror::default()
-                };
-            }
-            write_frame(&mut conn.tls, &Request::ChangesSince { seq: mirror.seen })?;
-            loop {
-                match recv(&mut conn.tls)? {
-                    Response::Changes { entries, more } => {
-                        mirror.received += entries.len() as u64;
-                        for (path, entry) in entries {
-                            mirror.seen = mirror.seen.max(entry.seq);
-                            mirror.entries.insert(path, entry);
-                        }
-                        if !more {
-                            return Ok(Ok(()));
-                        }
-                    }
-                    Response::Error(e) => return Ok(Err(e.into())),
-                    other => return Err(unexpected(&other)),
-                }
-            }
-        })?;
-        let mut out: Vec<(RelPath, Entry)> = mirror
-            .entries
-            .iter()
+        let snap = self.snapshot()?;
+        let mut out: Vec<(RelPath, Entry)> = snap
+            .entries()
             .filter(|(_, e)| e.seq > seq)
             .map(|(p, e)| (p.clone(), e.clone()))
             .collect();
         out.sort_by_key(|(_, e)| e.seq);
         Ok(out)
+    }
+
+    /// The mirror, shared. With the consistency check on (tests, the
+    /// `hooks` feature), the server's whole index is fetched once more and
+    /// compared with it.
+    fn snapshot(&self) -> Result<Arc<Snapshot>> {
+        self.refresh(|_conn, mirror| {
+            #[cfg(any(test, feature = "hooks"))]
+            {
+                let mut fresh = Vec::new();
+                if let Err(e) = fetch(_conn, 0, |entries| fresh.extend(entries))? {
+                    return Ok(Err(e));
+                }
+                mirror.cache.check(fresh);
+            }
+            Ok(Ok(mirror.cache.get()))
+        })
     }
 
     fn open_read(&self, path: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>> {
@@ -730,9 +766,7 @@ impl Replica for RemoteReplica {
                 }
             }
             if conn.session == mirror.session {
-                for path in &removed {
-                    mirror.entries.remove(path);
-                }
+                mirror.cache.removed(removed.iter().cloned());
             }
             Ok(Ok(removed))
         })?;

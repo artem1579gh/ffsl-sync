@@ -16,12 +16,14 @@ pub use remote::RemoteReplica;
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{PairConfig, ReplicaId};
+use crate::engine::Snapshot;
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::fs::commit::FileMeta;
@@ -52,6 +54,17 @@ pub trait Replica {
     /// Entries put since `seq` (exclusive), in seq order. [`LocalMeta`] is
     /// left out, as on the wire.
     fn changes_since(&self, seq: u64) -> Result<Vec<(RelPath, Entry)>>;
+
+    /// The whole index, as [`Replica::changes_since(0)`](Replica::changes_since)
+    /// gives it, shared. The default builds it anew on every call;
+    /// [`LocalReplica`] and [`RemoteReplica`] keep it between calls and read
+    /// only what changed since the last one (a
+    /// [`SnapshotCache`](crate::engine::SnapshotCache), issue #15). A
+    /// snapshot still held when the index changes is copied at the next
+    /// call, so a caller drops the last one before asking again.
+    fn snapshot(&self) -> Result<Arc<Snapshot>> {
+        Ok(Arc::new(Snapshot::new(self.id(), self.changes_since(0)?)))
+    }
 
     /// Streams the content of the file `path`, which must be the file
     /// `expect` describes (kind, size and hash; checked at EOF).
@@ -263,6 +276,10 @@ impl Replica for PairReplica {
 
     fn changes_since(&self, seq: u64) -> Result<Vec<(RelPath, Entry)>> {
         self.get().changes_since(seq)
+    }
+
+    fn snapshot(&self) -> Result<Arc<Snapshot>> {
+        self.get().snapshot()
     }
 
     fn open_read(&self, path: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>> {

@@ -33,6 +33,7 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 
 use crate::config::{FollowedWrite, PairConfig, ReplicaConfig, ReplicaId, SymlinkPolicy};
+use crate::engine::{CacheStats, Snapshot, SnapshotCache};
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
 use crate::fs::commit::{
@@ -82,6 +83,8 @@ pub struct LocalReplica {
     /// Files read since the last scan whose content did not hash to the
     /// indexed hash, with that hash (see [`LocalReplica::mark_stale`]).
     stale: Stale,
+    /// The index as [`Replica::snapshot`] last gave it (issue #15).
+    cache: Mutex<SnapshotCache>,
 }
 
 /// See [`LocalReplica::stale`]; filled by content readers, which may run on
@@ -158,6 +161,7 @@ impl LocalReplica {
             remote_peer: false,
             orphans: BTreeSet::new(),
             stale: Stale::default(),
+            cache: Mutex::new(SnapshotCache::new(config.id)),
         };
         if replica.trash.is_some() {
             replica.quarantine.set_trash(&replica.root)?;
@@ -236,6 +240,15 @@ impl LocalReplica {
 
     pub fn quarantine(&self) -> &Quarantine {
         &self.quarantine
+    }
+
+    /// What keeping the [`Replica::snapshot`] up to date took so far.
+    pub fn snapshot_stats(&self) -> CacheStats {
+        self.cache().stats()
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, SnapshotCache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Unlinks quarantined old inodes whose grace period is over, or turns
@@ -516,19 +529,23 @@ impl LocalReplica {
             hooks::point("watch.list_followed");
             let snap = self.index.read()?;
             let mut links = Vec::new();
-            for (path, e) in snap.iter_prefix(&RelPath::root())? {
-                if e.local.via_link.is_none() || !e.is_live() {
-                    continue;
-                }
-                let dir = e.kind == Kind::Dir;
-                let base = match disk.route(&snap, &path, false)? {
-                    Route::At(base) => base,
-                    _ => continue,
-                };
-                if let Some(fd) = disk.open_followed(&base, &path, &e)? {
-                    links.push(Followed { path, fd, dir });
-                }
-            }
+            snap.for_each_prefix(
+                &RelPath::root(),
+                |_| true,
+                |path, e| {
+                    if e.local.via_link.is_none() || !e.is_live() {
+                        return Ok(());
+                    }
+                    let dir = e.kind == Kind::Dir;
+                    let Route::At(base) = disk.route(&snap, &path, false)? else {
+                        return Ok(());
+                    };
+                    if let Some(fd) = disk.open_followed(&base, &path, &e)? {
+                        links.push(Followed { path, fd, dir });
+                    }
+                    Ok(())
+                },
+            )?;
             Ok(links)
         })();
         let links = match found {
@@ -1309,6 +1326,19 @@ impl Replica for LocalReplica {
             .collect())
     }
 
+    /// Reads only the entries put since the last call; the rows tombstone
+    /// GC removed were noted by [`Replica::record_sync`]. This replica is the
+    /// only writer of its index (the database is locked), and a put always
+    /// takes a fresh seq, so nothing else can make the cache stale.
+    fn snapshot(&self) -> Result<Arc<Snapshot>> {
+        let mut cache = self.cache();
+        let changes = self.changes_since(cache.seen())?;
+        cache.update(changes);
+        #[cfg(any(test, feature = "hooks"))]
+        cache.check(self.changes_since(0)?);
+        Ok(cache.get())
+    }
+
     fn open_read(&self, path: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>> {
         if !matches!(expect.kind, Kind::File { .. }) {
             return Err(invalid(path, "open_read of an entry that is not a file"));
@@ -1479,6 +1509,7 @@ impl Replica for LocalReplica {
             .record_sync(peer, &tombstones, now_ns(), retention)?;
         if !removed.is_empty() {
             tracing::debug!(root = %self.root.path().display(), count = removed.len(), "tombstones collected");
+            self.cache().removed(removed.iter().cloned());
         }
         Ok(removed)
     }
