@@ -2,6 +2,16 @@
 
 All times are UTC.
 
+## 0.2.1 — 2026.10.22 10:54:42
+
+The project is renamed from `files_sync` to `ffsl-sync` ("files, folders, symlinks sync"). Nothing else changes in how it syncs.
+
+- **Binary:** `files_sync` is now `ffsl-sync`. Update scripts, cron jobs and service units that run it. For `RUST_LOG`, the crate is now `ffsl_sync` (e.g. `RUST_LOG=ffsl_sync=debug`).
+- **Names on disk:** the state directory is now `$XDG_STATE_HOME/ffsl-sync/` (was `fsync/`), and the reserved prefix is `.~ffsl.` (was `.~fsync.`). This includes the root marker `.~ffsl.root.<replica-id>` and the trash `.~ffsl.trash`.
+- **Network:** the protocol's opening bytes changed, so 0.2.1 and 0.1.x do not talk to each other (`bad magic`). Upgrade both hosts of a network pair together.
+- **Existing pairs:** they are not carried over by themselves. Follow "Upgrading from `files_sync` 0.1.x" in `docs/usage.md`: a last sync with the old binary, then move the state directory and rename each root's marker and trash. Skipping it deletes nothing: the new binary does not find the pair, or refuses a root without its new marker.
+- **Repository:** moves to `github.com/artem1579gh/ffsl-sync`. Old links keep working through GitHub's redirect.
+
 ## 0.1.15 — 2026.10.21 12:44:00
 
 Fixes [issue #14](https://github.com/artem1579gh/files_sync/issues/14): six small problems, each rare, that could stop a path or a whole pair from syncing.
