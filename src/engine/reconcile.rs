@@ -4,6 +4,9 @@
 //! returns one [`Action`] for every path where something needs doing (or
 //! where something is deliberately not done: [`ActionKind::Skip`],
 //! [`ActionKind::Rescan`]). Paths that are in sync get no action.
+//! [`reconcile_paths`] decides at given paths only: the engine's rounds
+//! decide at the last round's action paths and the paths changed since
+//! (design §6.4, issue #15).
 //!
 //! Every resolution is safe by construction: the side that changes is always
 //! guarded by its own current entry (the replica checks it, §7), and nothing
@@ -20,7 +23,7 @@ use jiff::ToSpan;
 use jiff::civil::DateTime;
 
 use crate::config::ReplicaId;
-use crate::engine::{IndexView, Side, is_beneath};
+use crate::engine::{IndexView, Mark, Side, Snapshot, is_beneath};
 use crate::fs::{RelPath, conflict_name};
 use crate::index::{Entry, Kind, Ord4, VersionVector};
 
@@ -101,27 +104,80 @@ pub enum SkipReason {
 /// chosen in this call, is retried one second later. Actions are in path
 /// order.
 pub fn reconcile(a: &dyn IndexView, b: &dyn IndexView, now: DateTime) -> Vec<Action> {
-    let views = Views { a, b };
-    let paths: BTreeSet<&RelPath> = a.entries().chain(b.entries()).map(|(p, _)| p).collect();
+    run(Views { a, b }, union(a.entries(), b.entries()), now)
+}
+
+/// [`reconcile`] for `paths` only (design §6.4, issue #15): the actions the
+/// whole reconcile has at those paths, if every path where it has one is
+/// among them.
+///
+/// That holds for the paths of the last reconcile's actions plus the paths
+/// changed on either side since: a path's decision depends only on its own
+/// two entries, so one that had no action and did not change has none. What
+/// an action looks beyond its path at is looked up in the whole views (an
+/// unmanaged ancestor, the names taken for a conflict copy, what a deleted
+/// directory holds), and the actions it looks at (other conflict names, the
+/// actions beneath a deleted directory) are among `paths` too.
+pub fn reconcile_paths(
+    a: &dyn IndexView,
+    b: &dyn IndexView,
+    paths: &BTreeSet<RelPath>,
+    now: DateTime,
+) -> Vec<Action> {
+    run(Views { a, b }, paths.iter(), now)
+}
+
+/// What a reconcile leaves for the next one of the same pair (design §6.4,
+/// issue #15): where both snapshots stood, and the paths of all its actions
+/// (skips and rescans too).
+#[derive(Debug)]
+pub(crate) struct Carry {
+    marks: [Mark; 2],
+    paths: BTreeSet<RelPath>,
+}
+
+impl Carry {
+    /// After `actions`, the reconcile of `a` and `b`.
+    pub(crate) fn new(actions: &[Action], a: &Snapshot, b: &Snapshot) -> Carry {
+        Carry {
+            marks: [a.mark(), b.mark()],
+            paths: actions.iter().map(|x| x.path.clone()).collect(),
+        }
+    }
+
+    /// The paths the next reconcile, of `a` and `b`, must decide at
+    /// ([`reconcile_paths`]): the last one's action paths and the paths
+    /// changed since on either side. `None` if a snapshot cannot tell what
+    /// changed (another lineage, or too much changed): reconcile wholly.
+    pub(crate) fn paths(&self, a: &Snapshot, b: &Snapshot) -> Option<BTreeSet<RelPath>> {
+        let changed_a = a.changed_since(self.marks[0])?;
+        let changed_b = b.changed_since(self.marks[1])?;
+        let mut paths = self.paths.clone();
+        paths.extend(changed_a.chain(changed_b).cloned());
+        Some(paths)
+    }
+}
+
+/// Decides at `paths`, which come in path order without repeats.
+fn run<'p>(views: Views, paths: impl Iterator<Item = &'p RelPath>, now: DateTime) -> Vec<Action> {
+    let Views { a, b } = views;
     let mut names = Names {
         views,
         now,
         chosen: HashSet::new(),
     };
     let mut actions = BTreeMap::new();
-    let mut unmanaged: HashSet<&RelPath> = HashSet::new();
     for path in paths {
         if path.is_root() {
             continue;
         }
-        let (ea, eb) = (a.get(path), b.get(path));
-        if ea.is_some_and(Entry::is_unmanaged) || eb.is_some_and(Entry::is_unmanaged) {
-            unmanaged.insert(path);
-        }
-        let Some(decision) = decide(ea, eb, a.replica(), b.replica()) else {
+        let Some(decision) = decide(a.get(path), b.get(path), a.replica(), b.replica()) else {
             continue;
         };
-        let kind = match ancestors(path).find(|p| unmanaged.contains(p)) {
+        let unmanaged = |p: &RelPath| {
+            a.get(p).is_some_and(Entry::is_unmanaged) || b.get(p).is_some_and(Entry::is_unmanaged)
+        };
+        let kind = match ancestors(path).find(unmanaged) {
             Some(anc) => ActionKind::Skip(SkipReason::BeneathUnmanaged(anc)),
             None => decision.into_action(path, &views, &mut names),
         };
@@ -132,6 +188,24 @@ pub fn reconcile(a: &dyn IndexView, b: &dyn IndexView, now: DateTime) -> Vec<Act
         .into_iter()
         .map(|(path, kind)| Action { path, kind })
         .collect()
+}
+
+/// The paths of two path-ordered entry lists, merged, in path order without
+/// repeats.
+fn union<'v>(
+    a: impl Iterator<Item = (&'v RelPath, &'v Entry)>,
+    b: impl Iterator<Item = (&'v RelPath, &'v Entry)>,
+) -> impl Iterator<Item = &'v RelPath> {
+    let (mut a, mut b) = (a.map(|(p, _)| p).peekable(), b.map(|(p, _)| p).peekable());
+    std::iter::from_fn(move || match (a.peek(), b.peek()) {
+        (Some(pa), Some(pb)) if pa == pb => {
+            b.next();
+            a.next()
+        }
+        (Some(pa), Some(pb)) if pa < pb => a.next(),
+        (Some(_), Some(_)) | (None, _) => b.next(),
+        (Some(_), None) => a.next(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -376,9 +450,10 @@ fn present_after(action: Option<&ActionKind>, side: Side, current: Option<&Entry
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::Snapshot;
+    use crate::engine::SnapshotCache;
     use crate::index::UnmanagedReason;
     use jiff::civil::date;
+    use proptest::prelude::*;
 
     const IA: ReplicaId = ReplicaId(0x1111_2222_3333_4444);
     const IB: ReplicaId = ReplicaId(0xaaaa_bbbb_cccc_dddd);
@@ -911,6 +986,88 @@ mod tests {
             ActionKind::Push { from: Side::B, .. }
         ));
         assert_eq!(actions.len(), 3);
+    }
+
+    fn arb_entry() -> impl Strategy<Value = Option<Entry>> {
+        (
+            prop::sample::select(KINDS.to_vec()),
+            0u8..2,
+            0u64..3,
+            0u64..3,
+        )
+            .prop_map(|(k, variant, ca, cb)| mk(k, variant, vv(ca, cb)))
+    }
+
+    /// Paths over names that sort among a directory's children: `a-b` and
+    /// `a.b` come between `a` and `a/…`.
+    fn arb_path() -> impl Strategy<Value = RelPath> {
+        prop::collection::vec(prop::sample::select(vec!["a", "a-b", "a.b", "b"]), 1..4)
+            .prop_map(|c| rp(&c.join("/")))
+    }
+
+    /// The paths where two snapshots differ.
+    fn differ(x: &Snapshot, y: &Snapshot) -> BTreeSet<RelPath> {
+        x.entries()
+            .chain(y.entries())
+            .map(|(p, _)| p)
+            .filter(|p| x.get(p) != y.get(p))
+            .cloned()
+            .collect()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2048))]
+
+        /// Issue #15: reconciling only the last reconcile's action paths
+        /// and the paths changed since (as the snapshots' journals tell
+        /// them) gives exactly the whole reconcile's actions.
+        #[test]
+        fn incremental_reconcile_matches_the_whole(
+            index in prop::collection::vec((arb_path(), arb_entry(), arb_entry()), 0..24),
+            changes in prop::collection::vec((arb_path(), any::<bool>(), arb_entry()), 0..8),
+        ) {
+            let mut seq = 0;
+            let mut stamp = |mut e: Entry| {
+                seq += 1;
+                e.seq = seq;
+                e
+            };
+            let mut caches = [SnapshotCache::new(IA), SnapshotCache::new(IB)];
+            let mut first: [Vec<(RelPath, Entry)>; 2] = Default::default();
+            for (p, ea, eb) in index {
+                for (i, e) in [ea, eb].into_iter().enumerate() {
+                    if let Some(e) = e {
+                        first[i].push((p.clone(), stamp(e)));
+                    }
+                }
+            }
+            for (cache, entries) in caches.iter_mut().zip(first) {
+                cache.update(entries);
+            }
+            let (a0, b0) = (caches[0].get(), caches[1].get());
+            let carry = Carry::new(&run(&a0, &b0), &a0, &b0);
+            let marks = [a0.mark(), b0.mark()];
+
+            for (p, on_b, e) in changes {
+                let cache = &mut caches[usize::from(on_b)];
+                match e {
+                    Some(e) => cache.update(vec![(p, stamp(e))]),
+                    None => {
+                        cache.removed([p]);
+                        cache.update(Vec::new());
+                    }
+                }
+            }
+            let (a1, b1) = (caches[0].get(), caches[1].get());
+            let changed_a: BTreeSet<RelPath> = a1.changed_since(marks[0]).unwrap().cloned().collect();
+            let changed_b: BTreeSet<RelPath> = b1.changed_since(marks[1]).unwrap().cloned().collect();
+            prop_assert!(differ(&a0, &a1).is_subset(&changed_a));
+            prop_assert!(differ(&b0, &b1).is_subset(&changed_b));
+
+            let paths = carry.paths(&a1, &b1).unwrap();
+            prop_assert!(changed_a.is_subset(&paths) && changed_b.is_subset(&paths));
+            prop_assert_eq!(reconcile_paths(&*a1, &*b1, &paths, now()), run(&a1, &b1));
+        }
     }
 
     #[test]

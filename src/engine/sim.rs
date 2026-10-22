@@ -13,7 +13,13 @@ use jiff::civil::date;
 use proptest::prelude::*;
 
 use crate::config::ReplicaId;
-use crate::engine::{ActionKind, MAX_ROUNDS, Side, Snapshot, Step, is_beneath, plan, reconcile};
+use std::sync::Arc;
+
+use crate::engine::reconcile::Carry;
+use crate::engine::{
+    ActionKind, MAX_ROUNDS, Side, Snapshot, SnapshotCache, Step, is_beneath, plan, reconcile,
+    reconcile_paths,
+};
 use crate::fs::RelPath;
 use crate::index::{Entry, Kind, VersionVector};
 use crate::replica::{Op, Precondition};
@@ -26,6 +32,9 @@ struct Model {
     /// The Lamport floor (`IndexStore::max_counter`).
     max: u64,
     map: BTreeMap<RelPath, Entry>,
+    /// The index snapshot, kept as a replica keeps it (issue #15).
+    cache: SnapshotCache,
+    seq: u64,
 }
 
 impl Model {
@@ -34,11 +43,16 @@ impl Model {
             id,
             max: 0,
             map: BTreeMap::new(),
+            cache: SnapshotCache::new(id),
+            seq: 0,
         }
     }
 
-    fn put(&mut self, p: &RelPath, e: Entry) {
+    fn put(&mut self, p: &RelPath, mut e: Entry) {
         self.max = self.max.max(e.vv.max_counter());
+        self.seq += 1;
+        e.seq = self.seq;
+        self.cache.update(vec![(p.clone(), e.clone())]);
         self.map.insert(p.clone(), e);
     }
 
@@ -46,8 +60,8 @@ impl Model {
         self.map.get(p).filter(|e| e.is_live())
     }
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self.id, self.map.clone())
+    fn snapshot(&self) -> Arc<Snapshot> {
+        self.cache.get()
     }
 
     // User edits, as the scanner records them: a bumped vv per change.
@@ -246,11 +260,27 @@ impl Model {
     }
 }
 
-/// Runs sync rounds; returns how many had something to do.
-fn sync(a: &mut Model, b: &mut Model) -> Result<usize, String> {
+/// Runs sync rounds; returns how many had something to do. Each reconcile
+/// after the first (`carry`, across calls too) is also run incrementally
+/// (issue #15) and must give the same actions.
+fn sync(a: &mut Model, b: &mut Model, carry: &mut Option<Carry>) -> Result<usize, String> {
     let now = date(2026, 10, 2).at(9, 5, 7, 0);
     for round in 0..=MAX_ROUNDS {
-        let actions = reconcile(&a.snapshot(), &b.snapshot(), now);
+        let (sa, sb) = (a.snapshot(), b.snapshot());
+        let actions = reconcile(&*sa, &*sb, now);
+        if let Some(c) = carry.take() {
+            let paths = c
+                .paths(&sa, &sb)
+                .ok_or("the snapshots lost track of the changes")?;
+            let incremental = reconcile_paths(&*sa, &*sb, &paths, now);
+            if incremental != actions {
+                return Err(format!(
+                    "round {round}: incremental reconcile {incremental:#?} differs from {actions:#?}"
+                ));
+            }
+        }
+        *carry = Some(Carry::new(&actions, &sa, &sb));
+        drop((sa, sb));
         if let Some(act) = actions
             .iter()
             .find(|a| matches!(a.kind, ActionKind::Rescan))
@@ -385,7 +415,8 @@ proptest! {
             clock += 1;
             a.edit(e, clock);
         }
-        sync(&mut a, &mut b).map_err(TestCaseError::fail)?;
+        let mut last = None;
+        sync(&mut a, &mut b, &mut last).map_err(TestCaseError::fail)?;
         prop_assert_eq!(synced(&a), synced(&b));
 
         // Concurrent edits; B's clock runs a little ahead now and then, so
@@ -399,7 +430,7 @@ proptest! {
         let mut wanted = must_survive(&a, &b);
         wanted.extend(must_survive(&b, &a));
 
-        let rounds = sync(&mut a, &mut b).map_err(TestCaseError::fail)?;
+        let rounds = sync(&mut a, &mut b, &mut last).map_err(TestCaseError::fail)?;
         prop_assert!(rounds <= 3, "{} rounds", rounds);
         prop_assert_eq!(synced(&a), synced(&b));
         let kinds: HashSet<Kind> = a.map.values().filter(|e| e.is_live()).map(|e| e.kind.clone()).collect();

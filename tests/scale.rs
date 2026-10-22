@@ -12,13 +12,18 @@
 //! - **one file, scoped / full:** one small file changed on A, then a
 //!   scoped (daemon) or a full cycle;
 //! - **touch big, scoped:** the big file's mtime changed on A (T46: B's file
-//!   is changed in place).
+//!   is changed in place);
+//! - **scan A, full:** a full scan of A alone, nothing changed (T49: no set
+//!   of every path).
 //!
 //! Each line also gives the RSS before the phase and its peak RSS (`VmHWM`,
 //! reset before it through `/proc/self/clear_refs`; the allocator keeps
-//! freed memory, so the peak is never below the RSS before). Both replicas, and in remote mode
-//! both servers, run in this process, so it covers all of them. The two
-//! modes take turns (a lock), so each has the machine to itself.
+//! freed memory, so the peak is never below the RSS before), and the most
+//! heap the phase held above what was allocated when it began (counted by
+//! this test's global allocator, so memory freed earlier does not hide it).
+//! Both replicas, and in remote mode both servers, run in this process, so
+//! it covers all of them. The two modes take turns (a lock), so each has the
+//! machine to itself.
 //!
 //! Settings (environment variables):
 //! - `FFSL_SCALE_FILES` (200000): small files in the tree;
@@ -27,18 +32,72 @@
 
 mod harness;
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ffsl_sync::config::SymlinkPolicy;
 use ffsl_sync::engine::SyncReport;
+use ffsl_sync::replica::Replica;
 use ffsl_sync::scan::Scope;
 use harness::{Mode, Pair, rp};
 
 /// Files per directory.
 const PER_DIR: usize = 1000;
+
+/// The system allocator, counting the bytes allocated now and the most at
+/// any time since [`Heap::reset`].
+struct Heap {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[global_allocator]
+static HEAP: Heap = Heap {
+    now: AtomicUsize::new(0),
+    peak: AtomicUsize::new(0),
+};
+
+unsafe impl GlobalAlloc for Heap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            self.grew(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        self.now.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            self.now.fetch_sub(layout.size(), Ordering::Relaxed);
+            self.grew(new_size);
+        }
+        p
+    }
+}
+
+impl Heap {
+    fn grew(&self, size: usize) {
+        let now = self.now.fetch_add(size, Ordering::Relaxed) + size;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    /// Starts a new peak; returns the bytes allocated now.
+    fn reset(&self) -> usize {
+        let now = self.now.load(Ordering::Relaxed);
+        self.peak.store(now, Ordering::Relaxed);
+        now
+    }
+}
 
 fn env(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -85,25 +144,37 @@ fn populate(root: &Path, files: usize) {
 
 /// Runs one cycle, prints how long it took and its peak RSS.
 fn phase(p: &mut Pair, name: &str, scope: Scope) -> SyncReport {
+    measure(p, name, |p| {
+        let r = p
+            .engine
+            .sync(&mut p.a.replica, &mut p.b.replica, scope)
+            .unwrap();
+        assert!(r.is_converged(), "{name}: {r:?}");
+        p.a.replica.sweep_quarantine();
+        p.b.replica.sweep_quarantine();
+        r
+    })
+}
+
+/// Runs `f`, prints how long it took, its peak RSS and heap, and what it
+/// applied.
+fn measure(p: &mut Pair, name: &str, f: impl FnOnce(&mut Pair) -> SyncReport) -> SyncReport {
     reset_peak();
     let before = status_kib("VmRSS");
+    let heap = HEAP.reset();
     let traffic = p.traffic();
     let start = Instant::now();
-    let r = p
-        .engine
-        .sync(&mut p.a.replica, &mut p.b.replica, scope)
-        .unwrap();
+    let r = f(p);
     let took = start.elapsed();
     let peak = status_kib("VmHWM");
+    let heap_peak = HEAP.peak.load(Ordering::Relaxed) - heap;
     let moved = p.traffic() - traffic;
-    assert!(r.is_converged(), "{name}: {r:?}");
-    p.a.replica.sweep_quarantine();
-    p.b.replica.sweep_quarantine();
     eprintln!(
-        "  {name:<18} {:>9.3} s   RSS {:>6} -> peak {:>6} MiB   applied {:>7}{}",
+        "  {name:<18} {:>9.3} s   RSS {:>6} -> peak {:>6} MiB   heap +{:>5} MiB   applied {:>7}{}",
         took.as_secs_f64(),
         before / 1024,
         peak / 1024,
+        heap_peak >> 20,
         r.applied,
         if p.mode() == Mode::Remote {
             format!("   {:>9} KiB on the wire", moved / 1024)
@@ -159,6 +230,12 @@ fn scale(mode: Mode) {
         .unwrap();
     let r = phase(&mut p, "touch big, scoped", Scope::Paths(vec![rp("big")]));
     assert_eq!(r.applied, 1);
+
+    measure(&mut p, "scan A, full", |p| {
+        let stats = p.a.replica.scan(Scope::Full).unwrap();
+        assert_eq!(stats.changed, 0, "{stats:?}");
+        SyncReport::default()
+    });
 }
 
 both_modes! {

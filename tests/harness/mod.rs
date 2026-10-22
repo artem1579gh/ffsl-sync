@@ -639,9 +639,15 @@ impl Pair {
 
     /// One sync cycle, whatever its outcome; then sweeps the quarantines.
     pub fn try_sync(&mut self) -> SyncReport {
+        self.try_sync_scope(Scope::Full)
+    }
+
+    /// One sync cycle that scans `scope`, whatever its outcome; then sweeps
+    /// the quarantines.
+    pub fn try_sync_scope(&mut self, scope: Scope) -> SyncReport {
         let report = self
             .engine
-            .sync_once(&mut self.a.replica, &mut self.b.replica)
+            .sync(&mut self.a.replica, &mut self.b.replica, scope)
             .unwrap();
         self.a.replica.sweep_quarantine();
         self.b.replica.sweep_quarantine();

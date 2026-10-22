@@ -27,8 +27,11 @@
 //!   for files only) is written with `vv.bump_after(replica, max_counter)` and
 //!   a new seq. A change to [`LocalMeta`] alone is written in place, keeping
 //!   the seq. Indexed paths in the scanned region that are gone from disk
-//!   become tombstones. Every write checks that the entry still has the seq
-//!   the scan started from; otherwise the path is reported dirty.
+//!   become tombstones: after listing a directory, its children in the index
+//!   that the listing lacks, with their subtrees; after finding a child gone
+//!   or not a directory, what the index has beneath it. No set of the paths
+//!   found is kept (issue #15). Every write checks that the entry still has
+//!   the seq the scan started from; otherwise the path is reported dirty.
 //! - **Unstable paths** (a file changing while it is read, a symlink on a
 //!   path, a name replaced between two steps) leave their entry, and their
 //!   whole subtree, unchanged and are reported in [`ScanStats::dirty`]. Other
@@ -222,6 +225,9 @@ pub struct Scanner<'a> {
     keep_dirlinks_unsafe: bool,
     adopt: HashSet<RelPath>,
     racy_window: Duration,
+    /// Paths treated as changing while they are scanned (tests).
+    #[cfg(test)]
+    dirty: HashSet<RelPath>,
 }
 
 impl<'a> Scanner<'a> {
@@ -237,6 +243,8 @@ impl<'a> Scanner<'a> {
             keep_dirlinks_unsafe: false,
             adopt: HashSet::new(),
             racy_window: DEFAULT_RACY_WINDOW,
+            #[cfg(test)]
+            dirty: HashSet::new(),
         }
     }
 
@@ -285,16 +293,20 @@ impl<'a> Scanner<'a> {
             keep_dirlinks: self.keep_dirlinks,
             keep_dirlinks_unsafe: self.keep_dirlinks_unsafe,
             adopt: &self.adopt,
+            #[cfg(test)]
+            dirty: &self.dirty,
             replica: self.index.replica(),
             racy_cutoff: now.saturating_sub(window),
             snap: self.index.read()?,
             hasher: Hasher::new(),
             stack: Vec::new(),
-            seen: HashSet::new(),
+            noted: HashSet::new(),
             protected: HashSet::new(),
             regions: Vec::new(),
             pending: Vec::new(),
             stats: ScanStats::default(),
+            #[cfg(any(test, feature = "hooks"))]
+            oracle: Some(Oracle::default()),
         };
         match scope {
             Scope::Full => walk.scan_path(&RelPath::root())?,
@@ -304,7 +316,8 @@ impl<'a> Scanner<'a> {
                 }
             }
         }
-        walk.tombstones()?;
+        #[cfg(any(test, feature = "hooks"))]
+        walk.check_tombstones()?;
         walk.flush()?;
         let mut stats = walk.stats;
         stats.hashed = walk.hasher.hashed();
@@ -344,6 +357,20 @@ fn prefixes(p: &RelPath) -> impl Iterator<Item = &[u8]> {
         .chain((!b.is_empty()).then_some(b))
 }
 
+/// How a visit went, for what lies beneath the name.
+enum Visit {
+    /// A directory, open to descend into.
+    Dir(OpenDir),
+    /// Something else (a file, a symlink, an unmanaged object): nothing is
+    /// beneath it on disk.
+    Leaf,
+    /// Not there.
+    Gone,
+    /// Left as indexed (dirty, failed, already protected), with everything
+    /// beneath it.
+    Kept,
+}
+
 /// What one name turned out to be.
 enum Obs {
     /// Not there (or removed before we could look at it).
@@ -371,6 +398,20 @@ struct Level {
     path: RelPath,
     /// The names not visited yet.
     names: std::vec::IntoIter<Vec<u8>>,
+    /// The names the index has entries beneath (sorted): only beneath these
+    /// can a name found not to be a directory leave entries to tombstone.
+    deep: Vec<Vec<u8>>,
+}
+
+/// The tombstone pass the scanner had before issue #15, kept as an oracle
+/// (tests and the `hooks` feature): the paths found, and the tombstones the
+/// walk queued, which [`Walk::check_tombstones`] compares with what the old
+/// pass would have queued.
+#[cfg(any(test, feature = "hooks"))]
+#[derive(Default)]
+struct Oracle {
+    seen: HashSet<Vec<u8>>,
+    tombstoned: std::collections::BTreeSet<RelPath>,
 }
 
 struct OpenDir {
@@ -408,6 +449,8 @@ struct Walk<'a> {
     keep_dirlinks: bool,
     keep_dirlinks_unsafe: bool,
     adopt: &'a HashSet<RelPath>,
+    #[cfg(test)]
+    dirty: &'a HashSet<RelPath>,
     replica: ReplicaId,
     /// Files with a ctime at or after this are `racy`.
     racy_cutoff: i64,
@@ -416,14 +459,19 @@ struct Walk<'a> {
     hasher: Hasher,
     /// (dev, ino) of the directories on the current traversal path.
     stack: Vec<(u64, u64)>,
-    /// Paths found on disk.
-    seen: HashSet<Vec<u8>>,
+    /// Paths visited on the way to a scoped path (its ancestors, and where
+    /// the way ended): an ancestor shared by several is recorded once.
+    noted: HashSet<Vec<u8>>,
     /// Dirty or failed paths: they and their subtrees keep their entries.
     protected: HashSet<Vec<u8>>,
     /// Roots of the subtrees scanned recursively; tombstones are limited to these.
     regions: Vec<RelPath>,
     pending: Vec<Update>,
     stats: ScanStats,
+    /// `None` once a write failed at commit: the old pass would have kept
+    /// that path's subtree, the walk had tombstoned it already.
+    #[cfg(any(test, feature = "hooks"))]
+    oracle: Option<Oracle>,
 }
 
 impl Walk<'_> {
@@ -438,38 +486,64 @@ impl Walk<'_> {
         {
             return Ok(());
         }
+        // The walk runs from this small frame, not from `reach`'s: in a deep
+        // tree, the index writes beneath it need the stack (issue #14).
+        let Some((region, dir)) = self.reach(p)? else {
+            return Ok(());
+        };
+        if let Some(fd) = dir {
+            let res = self.walk_dir(fd, &region);
+            if !region.is_root() {
+                self.stack.pop();
+            }
+            res?;
+        }
+        self.regions.push(region);
+        Ok(())
+    }
+
+    /// Observes the ancestors of `p`, then `p`, up to the first that is not
+    /// a real directory: the region to scan recursively, with its directory
+    /// to walk (its id pushed on [`Walk::stack`]) if it is one. What the
+    /// index has beneath a region found gone or not a directory is
+    /// tombstoned here. `None` for a reserved name.
+    fn reach(&mut self, p: &RelPath) -> Result<Option<(RelPath, Option<OwnedFd>)>> {
         let mut dir = self.root.open_dir(&RelPath::root())?;
         let root_fp = Fingerprint::of_fd(dir.as_fd())?;
         self.stack = vec![(root_fp.dev, root_fp.ino)];
         if p.is_root() {
-            self.regions.push(RelPath::root());
-            return self.walk_dir(dir, &RelPath::root());
+            return Ok(Some((RelPath::root(), Some(dir))));
         }
         let names: Vec<&[u8]> = p.components().collect();
         let mut cur = RelPath::root();
         for (i, name) in names.iter().enumerate() {
             if is_reserved(name) {
-                return Ok(());
+                return Ok(None);
             }
             cur = cur.join(name)?;
             let last = i + 1 == names.len();
-            match self.visit(dir.as_fd(), &cur, name)? {
-                Some(d) if !last && !d.followed => {
+            let again = self.noted.contains(cur.as_bytes());
+            let visit = self.visit(dir.as_fd(), &cur, name)?;
+            self.noted.insert(cur.as_bytes().to_vec());
+            match visit {
+                Visit::Dir(d) if !last && !d.followed => {
                     self.stack.push(d.id);
                     dir = d.fd;
+                    continue;
                 }
-                Some(d) => {
+                Visit::Dir(d) => {
                     self.stack.push(d.id);
-                    let res = self.walk_dir(d.fd, &cur);
-                    self.stack.pop();
-                    res?;
-                    break;
+                    return Ok(Some((cur, Some(d.fd))));
                 }
-                None => break,
+                // A directory on the way to another scoped path a moment ago.
+                Visit::Leaf | Visit::Gone if again => self.replaced(&cur),
+                Visit::Leaf => self.tombstone_beneath(&cur, false)?,
+                Visit::Gone => self.tombstone_beneath(&cur, true)?,
+                Visit::Kept => {}
             }
+            break;
         }
-        self.regions.push(cur);
-        Ok(())
+        Ok(Some((cur, None)))
     }
 
     /// Visits everything beneath the directory `fd` (at `path`, whose id is
@@ -478,7 +552,7 @@ impl Walk<'_> {
     /// thread's stack (a `serve` connection thread has 2 MiB; issue #14).
     /// Each level holds its directory open, at most [`MAX_PATH_LEN`] / 2.
     fn walk_dir(&mut self, fd: OwnedFd, path: &RelPath) -> Result<()> {
-        let Some(top) = self.list(fd, path.clone()) else {
+        let Some(top) = self.list(fd, path.clone())? else {
             return Ok(());
         };
         let mut levels = vec![top];
@@ -492,78 +566,105 @@ impl Walk<'_> {
                 continue;
             };
             let child = level.path.join(&name)?;
-            let dir = self.visit(level.fd.as_fd(), &child, &name)?;
-            if self.pending.len() >= FLUSH_EVERY {
-                self.flush()?;
-            }
-            if let Some(d) = dir {
-                self.stack.push(d.id);
-                match self.list(d.fd, child) {
-                    Some(level) => levels.push(level),
-                    None => {
-                        self.stack.pop();
+            let deep = level.deep.binary_search(&name).is_ok();
+            let visit = self.visit(level.fd.as_fd(), &child, &name)?;
+            match visit {
+                Visit::Dir(d) => {
+                    self.stack.push(d.id);
+                    match self.list(d.fd, child)? {
+                        Some(level) => levels.push(level),
+                        None => {
+                            self.stack.pop();
+                        }
                     }
                 }
+                Visit::Leaf if deep => self.tombstone_beneath(&child, false)?,
+                Visit::Gone => self.tombstone_beneath(&child, true)?,
+                Visit::Leaf | Visit::Kept => {}
+            }
+            if self.pending.len() >= FLUSH_EVERY {
+                self.flush()?;
             }
         }
         Ok(())
     }
 
     /// The names in the directory `fd` (at `path`), to visit; `None` (and
-    /// the path failed) if it cannot be read.
-    fn list(&mut self, fd: OwnedFd, path: RelPath) -> Option<Level> {
+    /// the path failed) if it cannot be read. What the index has beneath
+    /// `path` under other names is gone: tombstoned.
+    fn list(&mut self, fd: OwnedFd, path: RelPath) -> Result<Option<Level>> {
         match list_dir(&fd) {
-            Ok(names) => Some(Level {
-                fd,
-                path,
-                names: names.into_iter(),
-            }),
+            Ok(names) => {
+                let mut deep = self.tombstone_unlisted(&path, &names)?;
+                deep.sort();
+                Ok(Some(Level {
+                    fd,
+                    path,
+                    names: names.into_iter(),
+                    deep,
+                }))
+            }
             Err(e) => {
                 self.fail(&path, Error::io(format!("read directory {path}"), e));
-                None
+                Ok(None)
             }
         }
     }
 
     /// Observes `parent/name` (at `path`) and queues its index update.
-    /// Returns a directory's open fd, to descend into.
-    fn visit(
-        &mut self,
-        parent: BorrowedFd<'_>,
-        path: &RelPath,
-        name: &[u8],
-    ) -> Result<Option<OpenDir>> {
+    fn visit(&mut self, parent: BorrowedFd<'_>, path: &RelPath, name: &[u8]) -> Result<Visit> {
         if self.protected.contains(path.as_bytes()) {
-            return Ok(None);
+            return Ok(Visit::Kept);
         }
         if path.as_bytes().len() > MAX_PATH_LEN {
             let e = io::Error::other("path longer than PATH_MAX; not synced");
             self.fail(path, Error::io(format!("scan {path}"), e));
-            return Ok(None);
+            return Ok(Visit::Kept);
         }
         self.stats.scanned += 1;
         let old = self.snap.get(path)?;
-        match self.observe(parent, path, name, old.as_ref())? {
-            Obs::Absent => Ok(None),
+        #[cfg(test)]
+        let observed = if self.dirty.contains(path) {
+            Obs::Dirty("made dirty by the test")
+        } else {
+            self.observe(parent, path, name, old.as_ref())?
+        };
+        #[cfg(not(test))]
+        let observed = self.observe(parent, path, name, old.as_ref())?;
+        match observed {
+            Obs::Absent => Ok(Visit::Gone),
             Obs::Dirty(reason) => {
                 tracing::debug!(%path, reason, "unstable during scan; left for a rescan");
                 self.stats.dirty.push(path.clone());
                 self.protected.insert(path.as_bytes().to_vec());
-                Ok(None)
+                Ok(Visit::Kept)
             }
             Obs::Failed(e) => {
                 self.fail(path, e);
-                Ok(None)
+                Ok(Visit::Kept)
             }
             Obs::Found(mut found) => {
                 let dir = found.dir.take();
+                #[cfg(any(test, feature = "hooks"))]
+                if let Some(o) = &mut self.oracle {
+                    o.seen.insert(path.as_bytes().to_vec());
+                }
                 // An ancestor shared by several scoped paths is recorded once.
-                if self.seen.insert(path.as_bytes().to_vec()) {
+                if !self.noted.contains(path.as_bytes()) {
                     self.record(path, old, found);
                 }
-                Ok(dir)
+                Ok(dir.map_or(Visit::Leaf, Visit::Dir))
             }
         }
+    }
+
+    /// `path` was a directory on the way to another scoped path a moment
+    /// ago, and is not now: it changed during the scan, and is recorded as
+    /// it was then. Left for a rescan, with its subtree.
+    fn replaced(&mut self, path: &RelPath) {
+        tracing::debug!(%path, "replaced during scan; left for a rescan");
+        self.stats.dirty.push(path.clone());
+        self.protected.insert(path.as_bytes().to_vec());
     }
 
     fn fail(&mut self, path: &RelPath, e: Error) {
@@ -925,39 +1026,95 @@ impl Walk<'_> {
         });
     }
 
-    /// Queues tombstones for indexed paths in the scanned regions that were
-    /// not found (and are not protected). Streams each region from the index
-    /// (issue #15), and decodes only the entries not seen.
-    fn tombstones(&mut self) -> Result<()> {
-        let regions = std::mem::take(&mut self.regions);
+    /// Queues tombstones for what the index has beneath `path` (and at
+    /// `path` itself, with `itself`): `path` is gone, or is not a directory.
+    fn tombstone_beneath(&mut self, path: &RelPath, itself: bool) -> Result<()> {
+        let key = path.as_bytes();
         let Walk {
             snap,
-            seen,
             protected,
             pending,
+            #[cfg(any(test, feature = "hooks"))]
+            oracle,
             ..
         } = self;
-        for region in regions {
-            snap.for_each_prefix(
-                &region,
-                |key| !seen.contains(key),
+        snap.for_each_prefix(
+            path,
+            |k| itself || k != key,
+            |p, e| {
+                queue_tombstone(
+                    pending,
+                    protected,
+                    #[cfg(any(test, feature = "hooks"))]
+                    oracle,
+                    p,
+                    &e,
+                );
+                Ok(())
+            },
+        )
+    }
+
+    /// Queues tombstones for what the index has beneath the directory
+    /// `dir` under a name its listing, `names` (sorted), lacks: such a child
+    /// is gone, with everything beneath it. Returns the listed names the
+    /// index has entries beneath.
+    fn tombstone_unlisted(&mut self, dir: &RelPath, names: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+        let Walk {
+            snap,
+            protected,
+            pending,
+            #[cfg(any(test, feature = "hooks"))]
+            oracle,
+            ..
+        } = self;
+        snap.for_each_unlisted(
+            dir,
+            |name| names.binary_search_by(|n| n.as_slice().cmp(name)).is_ok(),
+            |p, e| {
+                queue_tombstone(
+                    pending,
+                    protected,
+                    #[cfg(any(test, feature = "hooks"))]
+                    oracle,
+                    p,
+                    &e,
+                );
+                Ok(())
+            },
+        )
+    }
+
+    /// The oracle (tests and the `hooks` feature): panics unless the walk
+    /// queued exactly the tombstones the pass before issue #15 queued: every
+    /// indexed path in a scanned region that was not found, and is neither a
+    /// tombstone nor at or beneath a protected path.
+    #[cfg(any(test, feature = "hooks"))]
+    fn check_tombstones(&mut self) -> Result<()> {
+        let Some(oracle) = self.oracle.take() else {
+            return Ok(());
+        };
+        let mut old = std::collections::BTreeSet::new();
+        for region in &self.regions {
+            self.snap.for_each_prefix(
+                region,
+                |key| !oracle.seen.contains(key),
                 |path, e| {
-                    if e.is_tombstone() || prefixes(&path).any(|pre| protected.contains(pre)) {
-                        return Ok(());
+                    if !e.is_tombstone() && !prefixes(&path).any(|pre| self.protected.contains(pre))
+                    {
+                        old.insert(path);
                     }
-                    pending.push(Update {
-                        path,
-                        base: Some(e.seq),
-                        change: Change::New {
-                            kind: Kind::Tombstone,
-                            mode: 0,
-                            mtime_ns: 0,
-                            local: LocalMeta::default(),
-                        },
-                    });
                     Ok(())
                 },
             )?;
+        }
+        if old != oracle.tombstoned {
+            let new = &oracle.tombstoned;
+            panic!(
+                "the scan's tombstones differ from the old pass's\nonly new: {:?}\nonly old: {:?}",
+                new.difference(&old).take(5).collect::<Vec<_>>(),
+                old.difference(new).take(5).collect::<Vec<_>>(),
+            );
         }
         Ok(())
     }
@@ -986,6 +1143,10 @@ impl Walk<'_> {
                     if !vv.can_bump(txn.max_counter()) {
                         // A counter past the limit could not be read back
                         // (issue #14): only a peer at the limit gets us here.
+                        #[cfg(any(test, feature = "hooks"))]
+                        {
+                            self.oracle = None;
+                        }
                         self.fail(
                             &u.path,
                             Error::InvalidOp {
@@ -1018,6 +1179,34 @@ impl Walk<'_> {
         }
         txn.commit()
     }
+}
+
+/// Queues a tombstone for `path`, whose entry is `e`, unless it is one
+/// already or is protected (at or beneath a dirty or failed path).
+fn queue_tombstone(
+    pending: &mut Vec<Update>,
+    protected: &HashSet<Vec<u8>>,
+    #[cfg(any(test, feature = "hooks"))] oracle: &mut Option<Oracle>,
+    path: RelPath,
+    e: &Entry,
+) {
+    if e.is_tombstone() || prefixes(&path).any(|pre| protected.contains(pre)) {
+        return;
+    }
+    #[cfg(any(test, feature = "hooks"))]
+    if let Some(o) = oracle {
+        o.tombstoned.insert(path.clone());
+    }
+    pending.push(Update {
+        path,
+        base: Some(e.seq),
+        change: Change::New {
+            kind: Kind::Tombstone,
+            mode: 0,
+            mtime_ns: 0,
+            local: LocalMeta::default(),
+        },
+    });
 }
 
 /// Names in the directory `fd`, sorted, without `.`, `..` and reserved names.
@@ -1118,7 +1307,9 @@ fn errno_obs(e: Errno, path: &RelPath, what: &str) -> Obs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::Write;
     use std::rc::Rc;
@@ -1377,6 +1568,193 @@ mod tests {
             .unwrap();
         assert!(stats.dirty.is_empty(), "{stats:?}");
         assert_eq!(stats.errors, [rp("l")]);
+    }
+
+    /// Names that sort among a directory's children in the index: `-`,
+    /// `.`, `!`, space and `\x01` come before `/`, `0` right after it, and
+    /// `\xff` (not UTF-8) last.
+    const NAMES: [&[u8]; 9] = [
+        b"a", b"a-b", b"a.b", b"a!", b"a \x01", b"a0", b"a\xff", b"b", b"\xff",
+    ];
+
+    fn arb_rel() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(prop::sample::select(NAMES.to_vec()), 1..4)
+            .prop_map(|c| c.join(&b'/'))
+    }
+
+    #[derive(Clone, Debug)]
+    enum Edit {
+        Write(Vec<u8>, u8),
+        Mkdir(Vec<u8>),
+        Symlink(Vec<u8>),
+        Remove(Vec<u8>),
+    }
+
+    fn arb_edit() -> impl Strategy<Value = Edit> {
+        prop_oneof![
+            3 => (arb_rel(), any::<u8>()).prop_map(|(p, c)| Edit::Write(p, c)),
+            2 => arb_rel().prop_map(Edit::Mkdir),
+            1 => arb_rel().prop_map(Edit::Symlink),
+            3 => arb_rel().prop_map(Edit::Remove),
+        ]
+    }
+
+    /// Applies `edit` beneath `root` as a user would; an edit that does not
+    /// fit the tree (a parent is a file) does nothing.
+    fn edit(root: &std::path::Path, edit: &Edit) {
+        use std::os::unix::ffi::OsStrExt;
+        let at = |p: &[u8]| root.join(std::ffi::OsStr::from_bytes(p));
+        let parent = |p: &[u8]| match p.iter().rposition(|&c| c == b'/') {
+            Some(i) => fs::create_dir_all(at(&p[..i])).is_ok(),
+            None => true,
+        };
+        let clear = |p: &std::path::Path| match fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => drop(fs::remove_dir_all(p)),
+            Ok(_) => drop(fs::remove_file(p)),
+            Err(_) => {}
+        };
+        match edit {
+            Edit::Write(p, c) if parent(p) => {
+                clear(&at(p));
+                fs::write(at(p), [*c]).unwrap();
+            }
+            Edit::Mkdir(p) if parent(p) => {
+                if !at(p).is_dir() {
+                    clear(&at(p));
+                    fs::create_dir(at(p)).unwrap();
+                }
+            }
+            Edit::Symlink(p) if parent(p) => {
+                clear(&at(p));
+                std::os::unix::fs::symlink("t", at(p)).unwrap();
+            }
+            Edit::Remove(p) => clear(&at(p)),
+            _ => {}
+        }
+    }
+
+    /// Every path beneath `root` (not into unreadable directories), as
+    /// `lstat` sees it.
+    fn disk(root: &std::path::Path) -> HashSet<RelPath> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = HashSet::new();
+        let mut todo = vec![RelPath::root()];
+        while let Some(dir) = todo.pop() {
+            let Ok(list) = fs::read_dir(root.join(std::ffi::OsStr::from_bytes(dir.as_bytes())))
+            else {
+                continue;
+            };
+            for e in list {
+                let e = e.unwrap();
+                let p = dir.join(e.file_name().as_bytes()).unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    todo.push(p.clone());
+                }
+                out.insert(p);
+            }
+        }
+        out
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Issue #15: the merge-walk tombstones exactly what the old pass
+        /// over the set of found paths did (the oracle runs inside every
+        /// scan and panics on a difference), across names that sort among
+        /// a directory's children, stale and orphaned index entries,
+        /// unreadable directories, dirty paths and scoped scans. A full
+        /// scan also leaves the index matching the disk, but beneath the
+        /// paths it could not read, which keep their entries.
+        #[test]
+        fn merge_walk_tombstones_what_the_old_pass_did(
+            before in prop::collection::vec(arb_edit(), 0..16),
+            stale in prop::collection::vec((arb_rel(), any::<bool>()), 0..4),
+            after in prop::collection::vec(arb_edit(), 0..10),
+            unreadable in prop::collection::vec(arb_rel(), 0..2),
+            dirty in prop::collection::vec(arb_rel(), 0..2),
+            scope in prop::option::of(prop::collection::vec(arb_rel(), 1..4)),
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::ffi::OsStrExt;
+            let f = fixture();
+            let root = f.dir.path();
+            for e in &before {
+                edit(root, e);
+            }
+            f.scan();
+            // Index rows the disk does not explain: a file or a tombstone
+            // somewhere, maybe beneath a path the index lacks.
+            for (p, tomb) in stale {
+                let kind = if tomb {
+                    Kind::Tombstone
+                } else {
+                    Kind::File { size: 1, hash: [9; 32] }
+                };
+                let mut e = Entry::new(kind, 0o644, 1, crate::index::VersionVector::new());
+                f.index.put(&RelPath::new(p).unwrap(), &mut e).unwrap();
+            }
+            for e in &after {
+                edit(root, e);
+            }
+            let locked: Vec<std::path::PathBuf> = unreadable
+                .iter()
+                .map(|p| root.join(std::ffi::OsStr::from_bytes(p)))
+                .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                .collect();
+            for p in &locked {
+                fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let index_before: BTreeMap<RelPath, Entry> = f
+                .index
+                .read()
+                .unwrap()
+                .iter_prefix(&RelPath::root())
+                .unwrap()
+                .into_iter()
+                .collect();
+
+            let mut scanner = Scanner::new(&f.root, &f.index, SymlinkPolicy::Links);
+            scanner.dirty = dirty.iter().map(|p| RelPath::new(p.clone()).unwrap()).collect();
+            let scope = match &scope {
+                None => Scope::Full,
+                Some(paths) => Scope::Paths(paths.iter().map(|p| RelPath::new(p.clone()).unwrap()).collect()),
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scanner.scan(&scope)));
+            for p in &locked {
+                fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let stats = match result {
+                Ok(stats) => stats.unwrap(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+
+            if scope == Scope::Full {
+                // The paths it could not read keep their entries, and so
+                // does everything beneath them.
+                let kept: Vec<&RelPath> = stats.dirty.iter().chain(&stats.errors).collect();
+                let beneath_kept = |p: &RelPath| kept.iter().any(|k| *k == p || crate::engine::is_beneath(p, k));
+                let on_disk = disk(root);
+                let index: BTreeMap<RelPath, Entry> = f
+                    .index
+                    .read()
+                    .unwrap()
+                    .iter_prefix(&RelPath::root())
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+                for (p, e) in &index {
+                    if beneath_kept(p) {
+                        prop_assert_eq!(Some(e), index_before.get(p), "{} changed", p);
+                    } else {
+                        prop_assert_eq!(!e.is_tombstone(), on_disk.contains(p), "{}: {:?}", p, e);
+                    }
+                }
+                for p in &on_disk {
+                    prop_assert!(beneath_kept(p) || index.contains_key(p), "{} not indexed", p);
+                }
+            }
+        }
     }
 
     #[test]

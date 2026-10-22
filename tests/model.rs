@@ -38,6 +38,8 @@ use std::io::Write as _;
 
 use ffsl_sync::config::{ReplicaId, SymlinkPolicy};
 use ffsl_sync::engine::{Engine, Side};
+use ffsl_sync::fs::RelPath;
+use ffsl_sync::scan::Scope;
 use harness::{ID_A, ID_B, Mode, Pair, Tree, id7};
 use proptest::prelude::*;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
@@ -494,6 +496,8 @@ struct Run {
     clock: i64,
     /// The last unique write number.
     writes: u32,
+    /// Sync cycles run.
+    syncs: usize,
 }
 
 impl Run {
@@ -506,6 +510,7 @@ impl Run {
             model: Model::default(),
             clock: EPOCH,
             writes: 0,
+            syncs: 0,
         }
     }
 
@@ -653,7 +658,17 @@ impl Run {
 
     fn sync(&mut self) -> Result<(), String> {
         let copies = self.model.sync();
-        self.pair.sync();
+        // Every other cycle scans the whole tree without being a full
+        // cycle, so its first round reconciles only what changed since the
+        // last cycle (issue #15) instead of everything.
+        self.syncs += 1;
+        let report = if self.syncs.is_multiple_of(2) {
+            self.pair
+                .try_sync_scope(Scope::Paths(vec![RelPath::root()]))
+        } else {
+            self.pair.try_sync()
+        };
+        assert!(report.is_converged(), "sync did not converge: {report:#?}");
         self.pair.assert_converged();
         let real = self.pair.a.tree(SymlinkPolicy::Links);
         self.model.adopt(copies, &real)?;

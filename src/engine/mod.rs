@@ -16,11 +16,12 @@ pub use executor::{
     DEFAULT_MAX_DELETE_PERCENT, Engine, HeldBack, MASS_DELETE_MIN, MAX_ROUNDS, SyncReport,
 };
 pub use plan::{Phase, PhaseKind, Step, plan};
-pub use reconcile::{Action, ActionKind, Resolution, SkipReason, reconcile};
+pub use reconcile::{Action, ActionKind, Resolution, SkipReason, reconcile, reconcile_paths};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::ReplicaId;
 use crate::fs::RelPath;
@@ -61,11 +62,42 @@ pub trait IndexView {
 /// An in-memory [`IndexView`], e.g. built from
 /// [`Replica::changes_since(0)`](crate::replica::Replica::changes_since),
 /// or kept up to date by a [`SnapshotCache`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Besides the entries it keeps what the engine would otherwise find by
+/// walking all of them every round (issue #15): the number of live entries,
+/// the tombstones, and a journal of the paths that recent updates changed
+/// ([`Snapshot::changed_since`]).
+#[derive(Clone, Debug)]
 pub struct Snapshot {
     replica: ReplicaId,
     entries: BTreeMap<RelPath, Entry>,
+    /// Live entries, the root left out.
+    live: usize,
+    tombstones: BTreeSet<RelPath>,
+    /// Which cache this snapshot comes from: unique in the process. A
+    /// snapshot built on its own ([`Snapshot::new`]) has a lineage of its
+    /// own.
+    lineage: u64,
+    /// Updates applied since the snapshot was built.
+    version: u64,
+    /// The paths each update changed (put or removed), with the update's
+    /// version, in version order: every change after `floor`.
+    journal: Vec<(u64, RelPath)>,
+    floor: u64,
 }
+
+/// Where a [`Snapshot`] stood: its lineage and version. A later snapshot of
+/// the same lineage tells what changed since ([`Snapshot::changed_since`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    lineage: u64,
+    version: u64,
+}
+
+/// The journal holds this many changes, or one for every eight entries if
+/// that is more. A longer one is cleared: whoever is that far behind
+/// compares everything again, at a cost in proportion to the change.
+const JOURNAL_MIN: usize = 4096;
 
 impl Snapshot {
     /// A later entry for the same path replaces an earlier one.
@@ -73,10 +105,19 @@ impl Snapshot {
         replica: ReplicaId,
         entries: impl IntoIterator<Item = (RelPath, Entry)>,
     ) -> Snapshot {
-        Snapshot {
+        static LINEAGES: AtomicU64 = AtomicU64::new(1);
+        let mut snap = Snapshot {
             replica,
             entries: entries.into_iter().collect(),
-        }
+            live: 0,
+            tombstones: BTreeSet::new(),
+            lineage: LINEAGES.fetch_add(1, Ordering::Relaxed),
+            version: 0,
+            journal: Vec::new(),
+            floor: 0,
+        };
+        snap.count();
+        snap
     }
 
     pub fn len(&self) -> usize {
@@ -86,7 +127,90 @@ impl Snapshot {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Live entries, the root left out.
+    pub fn live(&self) -> usize {
+        self.live
+    }
+
+    /// The tombstones, in path order.
+    pub fn tombstones(&self) -> impl Iterator<Item = (&RelPath, &Entry)> {
+        self.tombstones.iter().map(|p| (p, &self.entries[p]))
+    }
+
+    /// Where this snapshot stands now.
+    pub fn mark(&self) -> Mark {
+        Mark {
+            lineage: self.lineage,
+            version: self.version,
+        }
+    }
+
+    /// The paths changed (put or removed) since this snapshot's lineage
+    /// stood at `mark`, in no particular order and maybe repeated. `None`
+    /// if that is not known: another lineage, or the journal no longer
+    /// reaches back that far.
+    pub fn changed_since(&self, mark: Mark) -> Option<impl Iterator<Item = &RelPath>> {
+        if mark.lineage != self.lineage || mark.version < self.floor || mark.version > self.version
+        {
+            return None;
+        }
+        let from = self.journal.partition_point(|(v, _)| *v <= mark.version);
+        Some(self.journal[from..].iter().map(|(_, p)| p))
+    }
+
+    /// Counts the live entries and indexes the tombstones anew.
+    fn count(&mut self) {
+        self.live = self
+            .entries
+            .iter()
+            .filter(|(p, e)| !p.is_root() && e.is_live())
+            .count();
+        self.tombstones = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.is_tombstone())
+            .map(|(p, _)| p.clone())
+            .collect();
+    }
+
+    /// Takes `old`, the entry that was at `path`, out of the counts.
+    fn uncount(&mut self, path: &RelPath, old: Option<Entry>) {
+        match old {
+            Some(e) if e.is_tombstone() => {
+                self.tombstones.remove(path);
+            }
+            Some(e) if e.is_live() && !path.is_root() => self.live -= 1,
+            _ => {}
+        }
+    }
+
+    fn insert(&mut self, path: RelPath, entry: Entry) {
+        let (tombstone, live) = (entry.is_tombstone(), entry.is_live() && !path.is_root());
+        let old = self.entries.insert(path.clone(), entry);
+        self.uncount(&path, old);
+        if tombstone {
+            self.tombstones.insert(path);
+        } else if live {
+            self.live += 1;
+        }
+    }
+
+    fn remove(&mut self, path: &RelPath) {
+        let old = self.entries.remove(path);
+        self.uncount(path, old);
+    }
 }
+
+/// The derived counts and the journal are left out: two snapshots are equal
+/// if they hold the same entries of the same replica.
+impl PartialEq for Snapshot {
+    fn eq(&self, other: &Snapshot) -> bool {
+        self.replica == other.replica && self.entries == other.entries
+    }
+}
+
+impl Eq for Snapshot {}
 
 /// A replica's index kept in memory across rounds and cycles (design §6.4,
 /// issue #15), so that a round reads only what changed since the last one:
@@ -139,7 +263,9 @@ impl SnapshotCache {
     }
 
     /// Takes out the rows noted as removed, then puts `changes`: entries put
-    /// since [`SnapshotCache::seen`], in the wire form.
+    /// since [`SnapshotCache::seen`], in the wire form. Each update that
+    /// changes something is a new version of the snapshot, whose journal
+    /// notes the paths it changed.
     pub fn update(&mut self, changes: Vec<(RelPath, Entry)>) {
         if changes.is_empty() && self.removed.is_empty() {
             return;
@@ -153,16 +279,34 @@ impl SnapshotCache {
             );
         }
         let snap = Arc::make_mut(&mut self.snap);
+        snap.version += 1;
+        let version = snap.version;
+        let cap = JOURNAL_MIN.max(snap.entries.len() / 8);
+        let journal = self.removed.len() + changes.len() <= cap;
         for path in self.removed.drain(..) {
-            snap.entries.remove(&path);
+            snap.remove(&path);
+            if journal {
+                snap.journal.push((version, path));
+            }
         }
         self.seen = changes.iter().fold(self.seen, |s, (_, e)| s.max(e.seq));
+        if journal {
+            snap.journal
+                .extend(changes.iter().map(|(p, _)| (version, p.clone())));
+        }
         if snap.entries.is_empty() {
             // Built in one go, the tree's nodes are full: a first read of a
             // big index takes less memory so.
             snap.entries = changes.into_iter().collect();
+            snap.count();
         } else {
-            snap.entries.extend(changes);
+            for (path, entry) in changes {
+                snap.insert(path, entry);
+            }
+        }
+        if !journal || snap.journal.len() > cap {
+            snap.journal.clear();
+            snap.floor = version;
         }
     }
 
@@ -191,6 +335,12 @@ impl SnapshotCache {
     pub fn check(&self, fresh: Vec<(RelPath, Entry)>) {
         let fresh = Snapshot::new(self.snap.replica, fresh);
         if *self.snap == fresh {
+            assert_eq!(
+                (self.snap.live, &self.snap.tombstones),
+                (fresh.live, &fresh.tombstones),
+                "the cached index snapshot of replica {} miscounts its entries",
+                self.snap.replica
+            );
             return;
         }
         let differ: Vec<_> = self

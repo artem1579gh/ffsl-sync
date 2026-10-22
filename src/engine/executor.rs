@@ -31,12 +31,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::engine::conflict::{ConflictCopy, log_resolutions};
+use crate::engine::reconcile::Carry;
 use crate::engine::{
     Action, ActionKind, IndexView, Side, SkipReason, Snapshot, Step, is_beneath, plan, reconcile,
+    reconcile_paths,
 };
 use crate::error::{Error, RemoteKind, Result};
 use crate::fs::RelPath;
@@ -64,6 +66,8 @@ pub struct Engine {
     tombstone_retention: Duration,
     delta_min_size: u64,
     max_delete_percent: u8,
+    /// What the last reconcile left for the next one, across cycles.
+    carry: Carried,
 }
 
 impl Default for Engine {
@@ -73,7 +77,29 @@ impl Default for Engine {
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             delta_min_size: DELTA_MIN_SIZE,
             max_delete_percent: DEFAULT_MAX_DELETE_PERCENT,
+            carry: Carried::default(),
         }
+    }
+}
+
+/// The [`Carry`] an [`Engine`] keeps between cycles. A clone of the engine
+/// starts without one.
+#[derive(Debug, Default)]
+struct Carried(Mutex<Option<Carry>>);
+
+impl Carried {
+    fn take(&self) -> Option<Carry> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    fn put(&self, carry: Option<Carry>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = carry;
+    }
+}
+
+impl Clone for Carried {
+    fn clone(&self) -> Carried {
+        Carried::default()
     }
 }
 
@@ -169,7 +195,10 @@ impl Engine {
     }
 
     /// A sync cycle that first scans `scope` on both replicas. The whole
-    /// indexes are reconciled, whatever the scope.
+    /// indexes are reconciled, whatever the scope: wholly in the first round
+    /// of a full cycle and of the engine's first cycle, then only at the
+    /// paths the last reconcile had actions for and those changed since
+    /// (design §6.4).
     ///
     /// Fails only if a replica's index or root fails; everything per path is
     /// in the report.
@@ -179,6 +208,8 @@ impl Engine {
         b: &mut dyn Replica,
         scope: Scope,
     ) -> Result<SyncReport> {
+        // A cycle that fails leaves none: the next one starts wholly.
+        let carry = self.carry.take().filter(|_| scope != Scope::Full);
         let mut cycle = Cycle {
             a,
             b,
@@ -188,6 +219,7 @@ impl Engine {
             unmanaged: BTreeSet::new(),
             adopt_asked: BTreeSet::new(),
             last: None,
+            carry,
             delta_min_size: self.delta_min_size,
             max_delete_percent: self.max_delete_percent,
             held: [None, None],
@@ -230,6 +262,7 @@ impl Engine {
         if let Some((a, b)) = cycle.last.take() {
             cycle.record_sync(&a, &b, self.tombstone_retention)?;
         }
+        self.carry.put(cycle.carry.take());
         let mut report = cycle.report;
         report.errors = cycle.errors.into_iter().collect();
         report.unmanaged = cycle.unmanaged.into_iter().collect();
@@ -275,6 +308,8 @@ struct Cycle<'r> {
     /// The snapshots the last reconcile compared: the state the cycle ends
     /// in, since nothing ran after it.
     last: Option<(Arc<Snapshot>, Arc<Snapshot>)>,
+    /// What the last reconcile left; `None` makes the next one whole.
+    carry: Option<Carry>,
     /// See [`Engine::delta_min_size`].
     delta_min_size: u64,
     /// See [`Engine::max_delete_percent`].
@@ -351,7 +386,9 @@ impl Cycle<'_> {
     ///
     /// The replicas keep their snapshots across rounds and cycles and read
     /// only what changed (issue #15). A snapshot is dropped before the next
-    /// one is asked for: one still held would be copied.
+    /// one is asked for: one still held would be copied. Only the paths the
+    /// last reconcile had actions for, and those changed since, are
+    /// decided again, if the snapshots can tell which changed.
     fn reconcile(&mut self) -> Result<Vec<Action>> {
         self.last = None;
         let mut a = self.a.snapshot()?;
@@ -366,8 +403,23 @@ impl Cycle<'_> {
             b = self.b.snapshot()?;
         }
         let now = jiff::Zoned::now().datetime();
+        let paths = self.carry.as_ref().and_then(|c| c.paths(&a, &b));
+        let actions = match paths {
+            Some(paths) => {
+                tracing::debug!(paths = paths.len(), "reconciling the changed paths");
+                let actions = reconcile_paths(&*a, &*b, &paths, now);
+                #[cfg(any(test, feature = "hooks"))]
+                check_incremental(&actions, &reconcile(&*a, &*b, now));
+                actions
+            }
+            None => {
+                tracing::debug!("reconciling the whole indexes");
+                reconcile(&*a, &*b, now)
+            }
+        };
+        self.carry = Some(Carry::new(&actions, &a, &b));
         let mut todo = Vec::new();
-        for action in reconcile(&*a, &*b, now) {
+        for action in actions {
             let path = &action.path;
             if self.has_failed(path) {
                 continue;
@@ -399,10 +451,7 @@ impl Cycle<'_> {
         for (i, side, snap) in [(0, Side::A, a), (1, Side::B, b)] {
             if self.held[i].is_none() {
                 let deletes = todo.iter().filter(|x| deletes_on(x, side)).count();
-                let live = snap
-                    .entries()
-                    .filter(|(p, e)| !p.is_root() && e.is_live())
-                    .count();
+                let live = snap.live();
                 if deletes > MASS_DELETE_MIN
                     && deletes * 100 > live * usize::from(self.max_delete_percent)
                 {
@@ -443,8 +492,7 @@ impl Cycle<'_> {
             ours: &Snapshot,
             peer: &Snapshot,
         ) -> Vec<(RelPath, crate::index::VersionVector, PeerState)> {
-            ours.entries()
-                .filter(|(_, e)| e.kind == Kind::Tombstone)
+            ours.tombstones()
                 .map(|(path, e)| {
                     let state = match peer.get(path) {
                         None => PeerState::Absent,
@@ -466,6 +514,10 @@ impl Cycle<'_> {
     /// a symlink (synced or ignored), the symlink's replica may adopt it as
     /// that directory. Asked once per path and cycle. Returns which sides
     /// adopted something.
+    ///
+    /// Such a path always has an action (a symlink against a directory is
+    /// never in sync), so with a carry only the paths the next reconcile
+    /// decides at are looked at.
     fn adopt_dirlinks(&mut self, a: &Snapshot, b: &Snapshot) -> Result<[bool; 2]> {
         let linkish = |e: &Entry| {
             matches!(
@@ -474,13 +526,19 @@ impl Cycle<'_> {
             )
         };
         let mut asks = Vec::new();
-        for (path, ea) in a.entries() {
-            let Some(eb) = b.get(path) else { continue };
+        let mut ask = |path: &RelPath| {
+            let (Some(ea), Some(eb)) = (a.get(path), b.get(path)) else {
+                return;
+            };
             if linkish(ea) && eb.kind == Kind::Dir {
                 asks.push((Side::A, path.clone()));
             } else if linkish(eb) && ea.kind == Kind::Dir {
                 asks.push((Side::B, path.clone()));
             }
+        };
+        match self.carry.as_ref().and_then(|c| c.paths(a, b)) {
+            Some(paths) => paths.iter().for_each(&mut ask),
+            None => a.entries().for_each(|(p, _)| ask(p)),
         }
         let mut adopted = [false; 2];
         for (side, path) in asks {
@@ -679,6 +737,30 @@ fn plan_delta(
     // Even if no block can be reused: the block lists cost 0.025 % of the
     // file, and every replaced file takes the same path.
     Ok(Some(Delta::plan(&have, new)))
+}
+
+/// The consistency check of the incremental reconcile (tests and the
+/// `hooks` feature): it must give exactly the whole reconcile's actions.
+#[cfg(any(test, feature = "hooks"))]
+fn check_incremental(incremental: &[Action], whole: &[Action]) {
+    if incremental == whole {
+        return;
+    }
+    let paths = |v: &[Action]| v.iter().map(|x| x.path.clone()).collect::<BTreeSet<_>>();
+    let (inc, all) = (paths(incremental), paths(whole));
+    let differ: Vec<String> = inc
+        .union(&all)
+        .filter(|p| {
+            let find = |v: &[Action]| v.iter().find(|x| x.path == **p).map(|x| x.kind.clone());
+            find(incremental) != find(whole)
+        })
+        .take(5)
+        .map(|p| p.to_string())
+        .collect();
+    panic!(
+        "the incremental reconcile differs from the whole one at {}:\nincremental: {incremental:#?}\nwhole: {whole:#?}",
+        differ.join(", ")
+    );
 }
 
 /// Errors that are not about one path: the replica itself, or the

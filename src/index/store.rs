@@ -382,6 +382,70 @@ impl ReadTxn {
         for_each_prefix(&self.entries()?, prefix, wanted, f)
     }
 
+    /// Calls `f`, in key order, on every entry strictly beneath `dir` whose
+    /// first name beneath it `listed` refuses: what the index holds there
+    /// that a listing of `dir` does not (the scanner's deletions, issue #15).
+    /// A refused entry and everything beneath it is decoded; the entries
+    /// beneath a listed name are skipped with one seek, not read. Returns
+    /// the listed names with entries beneath them, in no particular order.
+    ///
+    /// The keys beneath `dir/n` are exactly those in [`dir/n/`, `dir/n0`)
+    /// (`'0'` follows `'/'`), but other names sort among them: `dir/n-x`
+    /// and `dir/n.x` come between `dir/n` and `dir/n/…`. So the names come
+    /// in key order, not one subtree after another, and a name's subtree is
+    /// skipped when its first key beneath it turns up, by seeking to
+    /// `dir/n0`. That costs a lookup per listed name with entries beneath
+    /// it, and a step per name: O(children · log N) for the directory.
+    pub fn for_each_unlisted(
+        &self,
+        dir: &RelPath,
+        mut listed: impl FnMut(&[u8]) -> bool,
+        mut f: impl FnMut(RelPath, Entry) -> Result<()>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let entries = self.entries()?;
+        let mut deep = Vec::new();
+        let mut base = dir.as_bytes().to_vec();
+        if !dir.is_root() {
+            base.push(b'/');
+        }
+        // Everything beneath `dir` is below `dir0`; beneath the root, the
+        // whole table.
+        let end = (!dir.is_root()).then(|| [dir.as_bytes(), b"0"].concat());
+        let mut from = base.clone();
+        loop {
+            let range = match &end {
+                Some(end) => entries.range::<&[u8]>(from.as_slice()..end.as_slice()),
+                None => entries.range::<&[u8]>(from.as_slice()..),
+            }
+            .map_err(dberr)?;
+            let mut skip_to = None;
+            for row in range {
+                let (k, v) = row.map_err(dberr)?;
+                let key = k.value();
+                // The root itself (never indexed) is not beneath anything.
+                let Some(rest) = key.strip_prefix(base.as_slice()).filter(|r| !r.is_empty()) else {
+                    continue;
+                };
+                let (name, beneath) = match rest.iter().position(|&c| c == b'/') {
+                    Some(i) => (&rest[..i], true),
+                    None => (rest, false),
+                };
+                if !listed(name) {
+                    let (path, entry) = decode(key, v.value())?;
+                    f(path, entry)?;
+                } else if beneath {
+                    deep.push(name.to_vec());
+                    skip_to = Some([&key[..base.len() + name.len()], b"0"].concat());
+                    break;
+                }
+            }
+            match skip_to {
+                Some(next) => from = next,
+                None => return Ok(deep),
+            }
+        }
+    }
+
     /// Number of entries (tombstones included).
     pub fn len(&self) -> Result<u64> {
         self.entries()?.len().map_err(dberr)
