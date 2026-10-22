@@ -19,10 +19,13 @@
 //! - **rename to a conflict name** (§6.2) moves a checked file or symlink
 //!   aside like a delete, verifies it, and then renames it on to the new name
 //!   with `RENAME_NOREPLACE`;
-//! - **directory mode** (§5.4) is the one in-place change: a directory
-//!   cannot be replaced by a copy, so it is pinned, checked and `fchmod`ed
-//!   through the pinning fd. [`set_referent_mode`] does the same for the
-//!   directory a `-K` link points to (§4.3.1);
+//! - **directory mode** (§5.4): a directory cannot be replaced by a copy,
+//!   so it is pinned, checked and `fchmod`ed through the pinning fd.
+//!   [`set_referent_mode`] does the same for the directory a `-K` link
+//!   points to (§4.3.1);
+//! - **file mode and mtime** ([`set_file_meta`], §5.3.1) are changed in
+//!   place the same way, under a lease or followed by a rehash, so that no
+//!   write made meanwhile is hidden. Content is never written in place;
 //! - **materialize** (§4.3.1) replaces a followed directory link with a real
 //!   copy of the directory, staged as a whole tree under a temp name and
 //!   exchanged with the link like a replace;
@@ -34,7 +37,7 @@
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
 //! staged (or nothing, after a delete), and the parent must still resolve to
-//! the same directory (§5.3 step 5). Nothing is ever written in place, and nothing is unlinked unless
+//! the same directory (§5.3 step 5). No content is ever written in place, and nothing is unlinked unless
 //! it is verified to be ours or a verified, quarantined old inode.
 //!
 //! Before a commit creates a reserved name, or moves a user object to one, it
@@ -61,7 +64,9 @@ use crate::fs::caps::Caps;
 use crate::fs::hooks::point;
 use crate::fs::lease::{Lease, NoLease};
 use crate::fs::root::{RESOLVE, RelPath, Root, path_err};
-use crate::fs::stat::{Discard, FileKind, Fingerprint, stable_read};
+use crate::fs::stat::{
+    Discard, FileKind, Fingerprint, open_for_read, stable_read, stable_read_with,
+};
 use crate::fs::tmpname::{self, TmpId, TmpKind};
 use crate::index::journal::{Intent, IntentId, IntentOp, IntentState, Journal};
 
@@ -374,6 +379,148 @@ pub fn set_dir_mode(
     rustix::fs::fsync(&pin).map_err(|e| t.err("fsync", e))?;
     point("chmod.after_chmod");
     t.finish(&Fingerprint::of_fd(pin.as_fd())?)
+}
+
+/// Sets the mode and mtime of the regular file at `path`, which must match
+/// `expected`, in place (§5.3.1): a metadata change needs no copy.
+///
+/// The file is pinned with an `O_RDONLY` fd (`fchmod` refuses an `O_PATH`
+/// one) and checked against `expected` (inode, size, mtime, ctime and mode),
+/// leased if it can be (§5.3 step 4(b)), and changed through the pin. Setting
+/// an older mtime would hide a write made meanwhile, so the change only
+/// counts if nothing wrote to the file: the lease is still unbroken
+/// afterwards, or else the content, rehashed through the pin, still has
+/// `expected`'s hash (also when the entry is racy). Otherwise the outcome is
+/// [`Outcome::PreconditionFailed`]; the index keeps the old fingerprint, so
+/// the next scan sees the new ctime and rehashes.
+///
+/// When both the mode and the mtime change, an intent records the change
+/// first, so a crash between the two can be rolled back ([`recover`]).
+///
+/// `Ok(None)`, changing nothing, if the file has other hard links: a change
+/// in place would change them too, while they are independent files to us
+/// (§5.10), so the caller replaces it with a copy instead.
+pub fn set_file_meta(
+    ctx: &Ctx<'_>,
+    path: &RelPath,
+    expected: &Expected,
+    meta: FileMeta,
+) -> Result<Option<Outcome>> {
+    let failed = |reason| Ok(Some(Outcome::PreconditionFailed(reason)));
+    let Some(hash) = expected.hash else {
+        return Err(Error::InvalidOp {
+            path: path.as_bytes().to_vec(),
+            reason: "a metadata change needs the content hash",
+        });
+    };
+    let t = Target::resolve(ctx.root, path)?;
+    point("setmeta.before_pin");
+    // `O_NONBLOCK`: a FIFO swapped in does not block us.
+    let pin = match open_for_read(t.parent(), t.name) {
+        Ok(pin) => pin,
+        Err(Errno::NOENT) => return failed("name missing"),
+        // A symlink, or a socket.
+        Err(Errno::LOOP | Errno::NXIO) => return failed("not a file"),
+        // Someone else holds a lease on it.
+        Err(Errno::AGAIN) => return failed("file is leased"),
+        Err(e) => return Err(t.err("pin", e)),
+    };
+    let old = Fingerprint::of_fd(pin.as_fd())?;
+    if !expected.fp.unchanged(&old)
+        || old.kind != FileKind::File
+        || old.mode & MODE_MASK != expected.fp.mode & MODE_MASK
+    {
+        return failed("changed since scan");
+    }
+    if rustix::fs::fstat(&pin)
+        .map_err(|e| t.err("stat", e))?
+        .st_nlink
+        > 1
+    {
+        return Ok(None);
+    }
+    point("setmeta.pinned");
+
+    // A lease still held after the change proves that nobody wrote to the
+    // file since the pin (§5.3 step 4(b)).
+    let lease = match take_lease(ctx, &t, &old) {
+        Ok(lease) => lease,
+        Err(reason) => return failed(reason),
+    };
+    point("setmeta.leased");
+    let mode = meta.mode & MODE_MASK;
+    let (chmod, touch) = (mode != old.mode, meta.mtime_ns != old.mtime_ns);
+    if chmod && touch {
+        let mut rec = Record::new(ctx, IntentOp::SetMeta, &t, Some(expected))?;
+        rec.intent.staged = Some(Fingerprint {
+            mode,
+            mtime_ns: meta.mtime_ns,
+            ..old
+        });
+        rec.begin()?;
+    }
+    // The mode first: replay can only tell a crash between the two apart
+    // (and undo it) in this order.
+    if chmod {
+        rustix::fs::fchmod(&pin, Mode::from_raw_mode(mode)).map_err(|e| t.err("chmod", e))?;
+        point("setmeta.after_chmod");
+    }
+    if touch {
+        let times = Timestamps {
+            last_access: Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_OMIT,
+            },
+            last_modification: timespec(meta.mtime_ns),
+        };
+        rustix::fs::futimens(&pin, &times).map_err(|e| t.err("set mtime", e))?;
+    }
+    // The index records the new metadata next: it must not revert (issue #13).
+    rustix::fs::fsync(&pin).map_err(|e| t.err("fsync", e))?;
+    point("setmeta.after_change");
+
+    // A broken lease is dropped before the rehash, so its breaker does not
+    // wait for it.
+    let lease = lease.filter(|l| l.held() && !expected.racy);
+    let now = if lease.is_some() {
+        Fingerprint::of_fd(pin.as_fd())?
+    } else {
+        point("setmeta.before_rehash");
+        match rehash_pinned(&t, &pin) {
+            Ok((fp, h)) if h == hash => fp,
+            Ok(_) => return failed("changed during commit"),
+            Err(e) if e.is_unstable() => return failed("changed during commit"),
+            Err(e) => return Err(e),
+        }
+    };
+    if !now.same_file(&old)
+        || now.kind != FileKind::File
+        || (now.size, now.mode, now.mtime_ns) != (old.size, mode, meta.mtime_ns)
+    {
+        return failed("changed during commit");
+    }
+    let out = t.finish(&now);
+    drop(lease);
+    out.map(Some)
+}
+
+/// Hashes the file pinned by `pin` (at the target's name) through a dup of
+/// the pin, with the checks of [`stable_read`].
+fn rehash_pinned(t: &Target<'_>, pin: &OwnedFd) -> Result<(Fingerprint, [u8; 32])> {
+    stable_read_with(
+        t.name,
+        || {
+            let fd = rustix::io::fcntl_dupfd_cloexec(pin, 0)?;
+            rustix::fs::seek(&fd, rustix::fs::SeekFrom::Start(0))?;
+            Ok(fd)
+        },
+        |f2| match t.stat(t.name)? {
+            Some(f3) if f2.same_file(&f3) => Ok(None),
+            Some(_) => Ok(Some("name replaced during read")),
+            None => Ok(Some("name removed during read")),
+        },
+        &mut Discard,
+    )
 }
 
 /// One object of the tree [`materialize`] builds, relative to its top.
@@ -776,15 +923,16 @@ impl<'j> Record<'j> {
         expected: Option<&Expected>,
     ) -> Result<Record<'j>> {
         let fresh = |kind| TmpId::random().map(|id| tmpname::name(kind, id));
-        let tmp = fresh(match op {
-            IntentOp::Delete => TmpKind::Del,
-            _ => TmpKind::Temp,
-        })?;
+        let tmp = match op {
+            IntentOp::SetMeta => Vec::new(),
+            IntentOp::Delete => fresh(TmpKind::Del)?,
+            _ => fresh(TmpKind::Temp)?,
+        };
         let old = match op {
             IntentOp::Replace | IntentOp::Materialize | IntentOp::Delete => {
                 Some(fresh(TmpKind::Old)?)
             }
-            IntentOp::Create | IntentOp::Rename => None,
+            IntentOp::Create | IntentOp::Rename | IntentOp::SetMeta => None,
         };
         Ok(Record {
             journal: ctx.journal,
@@ -1795,6 +1943,9 @@ pub struct Recovered {
     pub restored: usize,
     /// User objects kept under these conflict names instead.
     pub conflicts: Vec<RelPath>,
+    /// Modes put back after a [`set_file_meta`] cut short between its chmod
+    /// and its mtime change.
+    pub reverted: usize,
     /// Foreign objects found at the intent's reserved names, left alone.
     pub foreign: usize,
     /// Why the intent was not replayed: its directory is not at the place
@@ -1855,6 +2006,11 @@ pub fn recover(
         Err(e) => return Err(e),
     };
     point("recover.resolved");
+    if intent.op == IntentOp::SetMeta {
+        revert_meta(&t, intent, &mut rep)?;
+        point("recover.done");
+        return Ok(rep);
+    }
     let tmp = intent.tmp.as_slice();
     match (intent.op, inspect(&t, tmp, intent)?) {
         (_, Found::Absent) => {}
@@ -1901,6 +2057,40 @@ pub fn recover(
     }
     point("recover.done");
     Ok(rep)
+}
+
+/// Replays a [`set_file_meta`] intent. A crash between its chmod and its
+/// mtime change leaves the expected file (same inode and size) with the new
+/// mode and the old mtime: the old mode goes back, so the rescan finds no
+/// change and the next sync sets both again. Merged with the peer's change
+/// instead, the newer of the two mtimes would win (§6.1), and an mtime set
+/// back by the user would be lost. Anything else is left alone: unchanged,
+/// completed (the rescan merges it with the peer's version, §5.8), or
+/// changed by someone else.
+fn revert_meta(t: &Target<'_>, intent: &Intent, rep: &mut Recovered) -> Result<()> {
+    let (Some(exp), Some(new)) = (intent.expected, intent.staged) else {
+        return Ok(());
+    };
+    let old = exp.fp;
+    // Not a file we can open: not one we changed.
+    let Ok(pin) = open_for_read(t.parent(), t.name) else {
+        return Ok(());
+    };
+    let now = Fingerprint::of_fd(pin.as_fd())?;
+    let midway = now.same_file(&old)
+        && now.kind == FileKind::File
+        && now.size == old.size
+        && now.mtime_ns == old.mtime_ns
+        && now.mode == new.mode
+        && new.mode != old.mode;
+    if midway {
+        rustix::fs::fchmod(&pin, Mode::from_raw_mode(old.mode & MODE_MASK))
+            .map_err(|e| t.err("chmod", e))?;
+        rustix::fs::fsync(&pin).map_err(|e| t.err("fsync", e))?;
+        point("recover.reverted");
+        rep.reverted += 1;
+    }
+    Ok(())
 }
 
 /// What a reserved name of an intent holds.

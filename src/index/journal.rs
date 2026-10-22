@@ -1,7 +1,7 @@
 //! The intent journal (design §5.3 step 1, §5.8).
 //!
-//! A commit that creates reserved (`.~ffsl.*`) names first records an
-//! [`Intent`] here, in the replica's index database, and commits it durably.
+//! A commit that creates reserved (`.~ffsl.*`) names, or changes a file's
+//! mode and mtime in place, first records an [`Intent`] here, in the replica's index database, and commits it durably.
 //! The intent names every reserved name the commit may use (chosen up front)
 //! and, once known, the identity of the objects involved. After a crash,
 //! [`LocalReplica::open`](crate::replica::LocalReplica::open) replays every
@@ -59,6 +59,11 @@ pub enum IntentOp {
     /// `materialize`: like `Replace`, but the staged object is a directory
     /// tree, all of it ours (removed with its content).
     Materialize,
+    /// `set_file_meta` changing both the mode and the mtime in place. It
+    /// uses no reserved name (`tmp` is empty); `expected` is the file as
+    /// checked, and `staged` the same with the new mode and mtime. Replay
+    /// puts the old mode back if the crash came between the two changes.
+    SetMeta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

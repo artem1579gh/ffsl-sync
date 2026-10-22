@@ -199,6 +199,32 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         policy: SymlinkPolicy::Links,
         keep: false,
+        name: "touch_file",
+        base: |p| p.a.write_at("f", "same content", T0),
+        change: |p| p.a.set_mtime("f", T1),
+        files: false,
+        held: Some("f"),
+    },
+    // Both change in place (T46), the mtime backwards: a crash between the
+    // two must not let the newer, old mtime win a merge.
+    Scenario {
+        policy: SymlinkPolicy::Links,
+        keep: false,
+        name: "chmod_touch_file",
+        base: |p| {
+            p.a.write_at("f", "same content", T1);
+            p.a.chmod("f", 0o644);
+        },
+        change: |p| {
+            p.a.chmod("f", 0o600);
+            p.a.set_mtime("f", T0);
+        },
+        files: false,
+        held: Some("f"),
+    },
+    Scenario {
+        policy: SymlinkPolicy::Links,
+        keep: false,
         name: "chmod_dir",
         base: |p| {
             p.a.mkdir("d");
@@ -719,6 +745,8 @@ fn crashes_at_every_hook_point() {
         "rename.after_rename",
         "rename.moved",
         "chmod.after_chmod",
+        "setmeta.after_chmod",
+        "setmeta.after_change",
         "materialize.copied",
         "materialize.filled",
         "quarantine.before_unlink",
@@ -735,7 +763,11 @@ fn crashes_during_recovery() {
         |sc| {
             matches!(
                 sc.name,
-                "replace_file" | "file_to_symlink" | "delete_tree" | "conflict"
+                "replace_file"
+                    | "file_to_symlink"
+                    | "delete_tree"
+                    | "conflict"
+                    | "chmod_touch_file"
             )
         },
         true,

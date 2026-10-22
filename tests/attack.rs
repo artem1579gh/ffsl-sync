@@ -61,6 +61,11 @@ const META: FileMeta = FileMeta {
     mode: 0o644,
     mtime_ns: 1_700_000_000_000_000_000,
 };
+/// What [`Op::SetFileMeta`] sets: both the mode and the mtime change.
+const CHMOD: FileMeta = FileMeta {
+    mode: 0o600,
+    mtime_ns: META.mtime_ns,
+};
 /// An mtime far in the past, so any write changes it.
 const OLD_MTIME: Duration = Duration::from_secs(1_600_000_000);
 
@@ -91,9 +96,11 @@ enum Op {
     Materialize,
     /// Changes the mode of `a/src` through the symlink `a/b/t` (`-K`).
     ChmodReferent,
+    /// Changes a file's mode and mtime in place.
+    SetFileMeta,
 }
 
-const ALL_OPS: [Op; 14] = [
+const ALL_OPS: [Op; 15] = [
     Op::CreateFile,
     Op::CreateSymlink,
     Op::Mkdir,
@@ -108,6 +115,7 @@ const ALL_OPS: [Op; 14] = [
     Op::ChmodDir,
     Op::Materialize,
     Op::ChmodReferent,
+    Op::SetFileMeta,
 ];
 
 impl Op {
@@ -122,7 +130,7 @@ impl Op {
     fn variants(self) -> &'static [Variant] {
         match self {
             // Nothing is quarantined, so there is no late write to catch.
-            Op::RenameFile => &[Variant::Plain, Variant::EditBefore],
+            Op::RenameFile | Op::SetFileMeta => &[Variant::Plain, Variant::EditBefore],
             _ if self.holds_file() => &[Variant::Plain, Variant::EditBefore, Variant::LateWrite],
             _ => &[Variant::Plain],
         }
@@ -140,6 +148,7 @@ impl Op {
             (Op::ReplaceFile, Variant::EditBefore) => Some("replace.before_exchange"),
             (Op::ReplaceFile, Variant::LateWrite) => Some("replace.quarantined"),
             (Op::RenameFile, Variant::EditBefore) => Some("rename.before_rename"),
+            (Op::SetFileMeta, Variant::EditBefore) => Some("setmeta.leased"),
             (_, Variant::EditBefore) => Some("delete.before_rename"),
             (_, Variant::LateWrite) => Some("delete.quarantined"),
         }
@@ -245,7 +254,9 @@ impl World {
         };
         match op {
             Op::CreateFile | Op::CreateSymlink | Op::Mkdir => {}
-            Op::ReplaceFile | Op::DeleteFile | Op::RenameFile => w.user_file(TARGET),
+            Op::ReplaceFile | Op::DeleteFile | Op::RenameFile | Op::SetFileMeta => {
+                w.user_file(TARGET)
+            }
             Op::ReplaceSymlink | Op::DeleteSymlink | Op::RenameSymlink => {
                 symlink("orig-target", w.p(TARGET)).unwrap();
                 w.expected = Some(Expected::from(w.root.stat(&rp(TARGET)).unwrap()));
@@ -457,6 +468,9 @@ fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
                 commit::materialize(&ctx, q, &t, exp(), 0o750, &tree, &mut open)
             })
         }
+        Op::SetFileMeta => call(TARGET, &mut |_| {
+            commit::set_file_meta(&ctx, &t, exp(), CHMOD).map(|out| out.expect("one link"))
+        }),
         Op::ChmodReferent => {
             let dir = w.referent.unwrap();
             call(SRC, &mut |_| {
@@ -609,7 +623,10 @@ fn reserved_leftovers(dirs: &[&Path]) -> Vec<PathBuf> {
 
 /// Runs one case and checks every invariant.
 fn check_case(op: Op, v: Variant, caps: Caps, inj: Injection) {
-    let ctx = format!("{op:?}/{v:?} tmpfile={} {inj:?}", caps.o_tmpfile);
+    let ctx = format!(
+        "{op:?}/{v:?} tmpfile={} leases={} {inj:?}",
+        caps.o_tmpfile, caps.leases
+    );
     let (w, r) = run(op, v, caps, Some(inj));
 
     // Nothing outside the root was created or changed.
@@ -673,13 +690,20 @@ fn caps() -> Caps {
 }
 
 /// The capability sets to run `op` under: both temp-file strategies when it
-/// stages a file.
+/// stages a file, and without leases for a change in place (which then
+/// rehashes).
 fn caps_variants(op: Op) -> Vec<Caps> {
     let caps = caps();
     let mut out = vec![caps];
     if op.stages_file() && caps.o_tmpfile {
         out.push(Caps {
             o_tmpfile: false,
+            ..caps
+        });
+    }
+    if op == Op::SetFileMeta && caps.leases {
+        out.push(Caps {
+            leases: false,
             ..caps
         });
     }
@@ -709,7 +733,7 @@ fn attack_op(op: Op) -> usize {
 fn commit_points() -> BTreeSet<&'static str> {
     const SRC: &str = include_str!("../src/fs/commit.rs");
     // `recover.*` points are reached by replay only (tests/crash.rs).
-    const PREFIXES: [&str; 11] = [
+    const PREFIXES: [&str; 12] = [
         "commit",
         "materialize",
         "journal",
@@ -720,6 +744,7 @@ fn commit_points() -> BTreeSet<&'static str> {
         "rmdir",
         "rename",
         "chmod",
+        "setmeta",
         "quarantine",
     ];
     let code = &SRC[..SRC.find("#[cfg(test)]").unwrap_or(SRC.len())];
@@ -814,4 +839,5 @@ attack_tests! {
     attack_chmod_dir => Op::ChmodDir,
     attack_materialize => Op::Materialize,
     attack_chmod_referent => Op::ChmodReferent,
+    attack_set_file_meta => Op::SetFileMeta,
 }

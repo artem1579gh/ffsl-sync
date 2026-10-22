@@ -49,7 +49,7 @@ To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks fo
 - **Mutation:**
   - Only `src/fs/commit.rs` may modify a replica.
   - Every mutation is a compare-and-swap against an expected fingerprint (temp file + `renameat2` with `RENAME_NOREPLACE`/`RENAME_EXCHANGE` + verify; design §5.3).
-  - Never write in place.
+  - Never write content in place. Only the mode and mtime of a pinned, verified inode may be changed in place (`set_dir_mode`, `set_file_meta`: the latter under a lease or followed by a rehash, design §5.3.1).
   - When in doubt, **preserve user data as a conflict copy**. Never unlink something you haven't verified.
 - **Data handling:**
   - Paths and symlink targets are raw bytes (`[u8]`/`OsStr`), never `String`/`str`.

@@ -1158,6 +1158,18 @@ impl LocalReplica {
                         if mode == e.mode && mtime_ns == e.mtime_ns {
                             return index_only(e, mtime_ns);
                         }
+                        let meta = FileMeta { mode, mtime_ns };
+                        let file_step = |out| match applied(out) {
+                            Ok(fp) => Step::put(path, file_entry(&fp, *hash, vv.clone())),
+                            Err(step) => step,
+                        };
+                        // In place, unless the file has other hard links
+                        // (`None`) or is followed (§5.3.1).
+                        if e.local.via_link.is_none()
+                            && let Some(out) = commit::set_file_meta(&ctx, rel, &exp, meta)?
+                        {
+                            return Ok(file_step(out));
+                        }
                         // Rewrite as a copy with the new metadata (of a
                         // followed file: the link is replaced by the copy);
                         // the content hash guards against a change mid-copy.
@@ -1168,12 +1180,8 @@ impl LocalReplica {
                             }
                             Err(err) => return Err(err),
                         };
-                        let meta = FileMeta { mode, mtime_ns };
                         let out = commit::replace_file(&ctx, q, rel, &exp, &mut copy, meta, hash)?;
-                        Ok(match applied(out) {
-                            Ok(fp) => Step::put(path, file_entry(&fp, *hash, vv)),
-                            Err(step) => step,
-                        })
+                        Ok(file_step(out))
                     }
                     Kind::Dir if mode != e.mode => match e.local.via_link {
                         None => Ok(
@@ -2061,7 +2069,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
 
     const ME: ReplicaId = ReplicaId(0x1111_2222_3333_4444);
@@ -2668,7 +2676,7 @@ mod tests {
         symlink("t", fx.p("l")).unwrap();
         fx.settled_scan();
 
-        // A file is rewritten as a copy with the new mode and mtime.
+        // A file is changed in place (T46).
         let e = fx.get("f");
         let op = Op::SetMeta {
             mode: 0o600,
@@ -2678,7 +2686,7 @@ mod tests {
         let e2 = applied(fx.apply("f", op, Precondition::matching(&e)));
         let md = fs::symlink_metadata(fx.p("f")).unwrap();
         assert_eq!((mode(&md), mtime_ns(&md)), (0o600, 99));
-        assert_ne!(md.ino(), e.local.ino);
+        assert_eq!(md.ino(), e.local.ino);
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"same content");
         assert_eq!(
             (&e2.kind, e2.mode, e2.mtime_ns, &e2.vv),
@@ -2739,6 +2747,222 @@ mod tests {
 
         assert_eq!(fx.settled_scan().changed, 1, "only the user's chmod");
         assert!(fx.leftovers().is_empty());
+    }
+
+    fn ctime_ns(md: &fs::Metadata) -> i64 {
+        md.ctime() * 1_000_000_000 + md.ctime_nsec()
+    }
+
+    fn set_meta_op(mode: u32, mtime_ns: i64, n: u64) -> Op {
+        Op::SetMeta {
+            mode,
+            mtime_ns,
+            vv: peer(n),
+        }
+    }
+
+    /// `user_file`'s mtime.
+    const USER_MTIME: i64 = 1_600_000_000_000_000_000;
+
+    /// T46 (issue #15): a metadata change to a regular file keeps its inode,
+    /// stages nothing, and leaves nothing in the quarantine or the trash.
+    /// The index records the new fingerprint, so the next scan finds nothing
+    /// to do. With a lease the file is not reread; without one it is.
+    #[test]
+    fn set_meta_changes_a_file_in_place() {
+        let mut fx = Fx::new();
+        let cfg = ReplicaConfig {
+            trash_days: 1,
+            ..fx.r.config().clone()
+        };
+        let parked = tempfile::tempdir().unwrap();
+        drop(std::mem::replace(
+            &mut fx.r,
+            LocalReplica::open(&cfg, parked.path()).unwrap(),
+        ));
+        fx.r = LocalReplica::open(&cfg, fx._state.path())
+            .unwrap()
+            .racy_window(RACY)
+            .quarantine_grace(Duration::ZERO);
+        user_file(&fx, "f", b"same content");
+        fx.settled_scan();
+        let ino = fx.get("f").local.ino;
+        // Mode only, mtime only, both; then both without leases.
+        let cases = [
+            (0o600, USER_MTIME, true),
+            (0o600, 99, true),
+            (0o640, 7, true),
+            (0o604, 8, false),
+        ];
+        for (n, (m, t, leases)) in cases.into_iter().enumerate() {
+            fx.r.caps_mut().leases = leases;
+            // A racy entry is always reread.
+            fx.settled_scan();
+            let e = fx.get("f");
+            assert!(!e.local.racy);
+            hooks::start_trace();
+            let e2 = applied(fx.apply(
+                "f",
+                set_meta_op(m, t, n as u64 + 1),
+                Precondition::matching(&e),
+            ));
+            let trace = hooks::take_trace();
+            let md = fs::symlink_metadata(fx.p("f")).unwrap();
+            assert_eq!(
+                (md.ino(), mode(&md), mtime_ns(&md)),
+                (ino, m, t),
+                "case {n}"
+            );
+            assert_eq!(fs::read(fx.p("f")).unwrap(), b"same content");
+            assert_eq!((e2.mode, e2.mtime_ns, &e2.vv), (m, t, &peer(n as u64 + 1)));
+            let stored = fx.get("f");
+            assert_eq!(
+                (stored.local.ino, stored.local.ctime_ns),
+                (ino, ctime_ns(&md))
+            );
+            assert!(trace.contains(&"setmeta.after_change"), "{trace:?}");
+            let staged = trace
+                .iter()
+                .any(|p| p.starts_with("stage.") || p.starts_with("replace."));
+            assert!(!staged, "case {n}: {trace:?}");
+            assert_eq!(
+                trace.contains(&"setmeta.before_rehash"),
+                !leases,
+                "case {n}"
+            );
+            assert!(fx.r.quarantine().is_empty());
+            assert!(pending(&fx).is_empty(), "case {n}: intent finished");
+        }
+        assert!(!fx.p(".~ffsl.trash").exists());
+        assert!(fx.leftovers().is_empty());
+        assert_eq!(fx.settled_scan().changed, 0);
+    }
+
+    /// T46: a file with other hard links is still replaced by a copy (they
+    /// are independent files to us, §5.10), and the other links keep their
+    /// metadata.
+    #[test]
+    fn set_meta_copies_a_file_with_other_links() {
+        let mut fx = Fx::new();
+        user_file(&fx, "f", b"shared");
+        fs::hard_link(fx.p("f"), fx.p("g")).unwrap();
+        fx.settled_scan();
+        let e = fx.get("f");
+        applied(fx.apply("f", set_meta_op(0o600, 99, 1), Precondition::matching(&e)));
+        let f = fs::symlink_metadata(fx.p("f")).unwrap();
+        let g = fs::symlink_metadata(fx.p("g")).unwrap();
+        assert_ne!(f.ino(), e.local.ino);
+        assert_eq!((mode(&f), mtime_ns(&f)), (0o600, 99));
+        assert_eq!(
+            (g.ino(), mode(&g), mtime_ns(&g)),
+            (e.local.ino, 0o644, USER_MTIME)
+        );
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"shared");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// T46: setting the mtime back would hide a write made meanwhile, with
+    /// or without a lease. Such a write makes the op fail, and the next
+    /// scan records it.
+    #[test]
+    fn set_meta_never_hides_a_write() {
+        // A writer that opens the file after our pin, and one that had it
+        // open before (whose write needs no open, so it refuses the lease
+        // instead of waiting for it).
+        for leases in [true, false] {
+            for (point, opened_before) in [("setmeta.pinned", false), ("setmeta.after_chmod", true)]
+            {
+                let ctx = format!("leases {leases}, {point}");
+                let mut fx = Fx::new();
+                fx.r.caps_mut().leases = leases;
+                user_file(&fx, "f", b"original");
+                fx.settled_scan();
+                let e = fx.get("f");
+                let path = fx.p("f");
+                let held =
+                    opened_before.then(|| fs::File::options().write(true).open(&path).unwrap());
+                let _g = hooks::once(point, move || {
+                    let f = held
+                        .unwrap_or_else(|| fs::File::options().write(true).open(&path).unwrap());
+                    // Same size; the mtime moves, and we would set it back.
+                    f.write_all_at(b"OVERWRIT", 0).unwrap();
+                });
+                let cur =
+                    failed(fx.apply("f", set_meta_op(0o600, 99, 1), Precondition::matching(&e)));
+                assert_eq!(cur, Some(wire(e.clone())), "{ctx}");
+                assert_eq!(fs::read(fx.p("f")).unwrap(), b"OVERWRIT", "{ctx}");
+                assert_eq!(fx.get("f"), e, "{ctx}: index untouched");
+                assert!(fx.scan().changed > 0, "{ctx}");
+                let now = fx.get("f");
+                let written = Kind::File {
+                    size: 8,
+                    hash: hash(b"OVERWRIT"),
+                };
+                assert_eq!(now.kind, written, "{ctx}");
+                assert_eq!(now.vv.compare(&e.vv), Ord4::Dominates, "{ctx}");
+                assert!(fx.leftovers().is_empty(), "{ctx}");
+            }
+        }
+    }
+
+    /// T46: a crash between the chmod and the mtime change of a metadata
+    /// change is rolled back at the next open, so the rescan finds no change
+    /// (and the next sync sets both again). A completed change is left as
+    /// it is, and so is one the user changed since.
+    #[test]
+    fn set_meta_replay_puts_the_old_mode_back() {
+        use crate::index::{IntentOp, IntentState};
+        let mut fx = Fx::new();
+        for f in ["midway", "done", "user"] {
+            user_file(&fx, f, b"content");
+        }
+        fx.settled_scan();
+        let root_fp = Fingerprint::of_fd(fx.r.root().fd()).unwrap();
+        let intent = |f: &str| {
+            let fp = fx.r.root().stat(&rp(f)).unwrap();
+            Intent {
+                op: IntentOp::SetMeta,
+                path: rp(f),
+                parent: root_fp,
+                tmp: Vec::new(),
+                old: None,
+                expected: Some(Expected {
+                    fp,
+                    hash: Some(hash(b"content")),
+                    racy: false,
+                }),
+                staged: Some(Fingerprint {
+                    mode: 0o600,
+                    mtime_ns: 99,
+                    ..fp
+                }),
+                state: IntentState::Started,
+                base: RelPath::root(),
+            }
+        };
+        let intents: Vec<_> = ["midway", "done", "user"].map(intent).into();
+        let before = fx.get("midway").vv;
+        fs::set_permissions(fx.p("midway"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(fx.p("done"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(fx.p("done"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_nanos(99))
+            .unwrap();
+        fs::set_permissions(fx.p("user"), fs::Permissions::from_mode(0o640)).unwrap();
+        reopen_with(&mut fx, &intents);
+        assert!(pending(&fx).is_empty());
+        let meta = |f: &str| {
+            let md = fs::symlink_metadata(fx.p(f)).unwrap();
+            (mode(&md), mtime_ns(&md))
+        };
+        assert_eq!(meta("midway"), (0o644, USER_MTIME));
+        assert_eq!(meta("done"), (0o600, 99));
+        assert_eq!(meta("user"), (0o640, USER_MTIME));
+        let stats = fx.settled_scan();
+        assert_eq!(stats.changed, 2, "{stats:?}: done and user");
+        assert_eq!(fx.get("midway").vv, before, "no logical change");
     }
 
     #[test]

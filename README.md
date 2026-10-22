@@ -19,7 +19,7 @@ A two-way file synchronizer for Linux that **stays correct while files are being
 
 - **Path resolution:** every filesystem operation resolves the parent directory with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` and acts on a single name relative to that directory fd. A directory swapped for a symlink mid-sync cannot redirect a write outside the tree.
 - **Reads:** a file is hashed while it is read, and its metadata is checked before and after. Torn reads are retried, never propagated.
-- **Writes:** nothing is written in place.
+- **Writes:** no content is written in place. A change of permissions or modification time alone is made in place on the checked file, under a lease or followed by a rehash, so a concurrent write is never hidden.
   1. New content goes to a temp file and is fsynced.
   2. The temp file is committed with `renameat2(RENAME_NOREPLACE)` or `renameat2(RENAME_EXCHANGE)`.
   3. The file that was swapped out is checked against what we expected. If someone changed it meanwhile, it is put back or kept as a conflict copy.
