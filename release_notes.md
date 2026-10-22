@@ -2,6 +2,15 @@
 
 All times are UTC.
 
+## 0.2.2 — 2026.10.22 19:23:17
+
+Fixes [issue #15](https://github.com/artem1579gh/ffsl-sync/issues/15): on big trees, syncing a small change cost time and memory in proportion to the whole tree. Nothing changes in what is synced, in the config, the CLI or the protocol, so a 0.2.2 host still talks to a 0.2.1 one.
+
+- **Daemon cycles:** a cycle after a change now works only on what changed, instead of going over every entry of both indexes in each of its rounds. With 1 million files, syncing one changed file now takes 0.09 s instead of 8 s, and the cycle that follows a sync's own writes takes under a millisecond instead of 4 s. Full cycles (`sync --once`, and the daemon's rescan every 10 minutes) still scan both trees, but are about 10–45 % faster.
+- **Memory:** a cycle no longer briefly holds extra copies of both indexes (about 1 GB at 1 million files), and a full scan no longer keeps a list of every path it found.
+- **`chmod` and `touch`:** a change of only a file's permissions or modification time is now made in place on the other side. Before, the file was rewritten as a full copy: a `touch` of a 10 GB file wrote 10 GB, needed 10 GB of free space, and put the old version into the trash. A file with other hard links is still copied, so the other links keep their old metadata.
+- **Followed links:** after each change, the daemon no longer reads the whole index looking for followed symlinks when its `symlinks` setting cannot follow any.
+
 ## 0.2.1 — 2026.10.22 10:54:42
 
 The project is renamed from `files_sync` to `ffsl-sync` ("files, folders, symlinks sync"). Nothing else changes in how it syncs.

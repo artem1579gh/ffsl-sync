@@ -1242,6 +1242,20 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 [Issue #15](https://github.com/artem1579gh/ffsl-sync/issues/15): several costs grow with the size of the whole index instead of with the size of a change, which matters for trees of 10^5–10^7 files. The issue's four items map to T46–T49 as follows. Item 4 is T46, item 2 is T47, item 1 is T48 + T49, item 3 is T48 (part) + T49. The line numbers in the issue are stale; the tasks below name functions instead. Do the tasks in order. The release that closes the issue is made after T49, not by these tasks.
 
+**Released in 0.2.2.** End-to-end check before the release: `tests/scale.rs` from T49 run against 0.2.1 (`fcfeab2`, with only that file added) and against T49 (`ccc3b59`), on tmpfs, on the same machine (32 cores), with each run alone. `cargo test`, `cargo test --features hooks` and clippy (with and without `hooks`) passed on `ccc3b59`. The columns give seconds and the peak heap above the phase's start (MiB):
+
+| phase | local 200k, 0.2.1 | 0.2.2 | remote 200k, 0.2.1 | 0.2.2 | local 1M, 0.2.1 | 0.2.2 | remote 1M, 0.2.1 | 0.2.2 |
+|---|---|---|---|---|---|---|---|---|
+| initial | 70.1 s, +404 | 69.9 s, +411 | 97.2 s, +499 | 96.5 s, +450 | 362 s, +1993 | 363 s, +1993 | 489 s, +2482 | 488 s, +2203 |
+| no-op full | 10.7 s, +228 | 9.59 s, +61 | 10.2 s, +228 | 9.55 s, +61 | 43.9 s, +1018 | 39.4 s, +247 | 42.0 s, +1017 | 39.4 s, +247 |
+| no-op scoped | 0.737 s, +167 | 0.000 s, +0 | 0.506 s, +167 | 0.001 s, +0 | 3.85 s, +771 | 0.000 s, +0 | 2.62 s, +771 | 0.001 s, +0 |
+| one file, scoped | 1.58 s, +203 | 0.012 s, +0 | 1.10 s, +203 | 0.011 s, +0 | 7.94 s, +1006 | 0.086 s, +0 | 6.06 s, +1007 | 0.042 s, +0 |
+| one file, full | 3.50 s, +270 | 1.93 s, +0 | 3.05 s, +270 | 1.92 s, +0 | 18.6 s, +1287 | 10.4 s, +0 | 17.2 s, +1287 | 10.1 s, +0 |
+| touch big (256 MiB), scoped | 2.17 s, +270 | 0.205 s, +0 | 1.76 s, +270 | 0.206 s, +0 | 8.35 s, +1287 | 0.212 s, +0 | 6.97 s, +1287 | 0.206 s, +0 |
+| scan A, full | 1.20 s, +74 | 1.05 s, +0 | 1.19 s, +74 | 1.05 s, +0 | 5.74 s, +328 | 4.73 s, +0 | 5.56 s, +328 | 4.72 s, +0 |
+
+Peak RSS at 1M files in remote mode (both replicas and both servers in one process) went from 3.4 GB to 2.3 GB during cycles after the initial sync. What is still O(N) per cycle: the full scans of a full cycle, the initial sync, a `serve` status report after each `RecordSync` (`ReplicaStatus::from_index`), and the tombstone GC list (O(tombstones)).
+
 ### [x] T46: A metadata-only change to a file is applied in place, not as a full copy (issue #15, item 4)
 - **Depends on:** T45
 - **Read:** §3 (what counts as a change), §5.3 (especially step 4(b), leases, and 4(d)), §5.4, §5.8, §5.10 (the Hardlinks row), §7 (`SetMeta` under Ops)

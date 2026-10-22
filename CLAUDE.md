@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`ffsl-sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M12 are implemented (M12: performance, issue #15, T46–T49; the release that closes the issue is not made yet).
+`ffsl-sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M12 are implemented, and every task in `claude/tasks.md` is done.
 
 - **Design:** [`claude/design.md`](claude/design.md). It is the source of truth; keep it updated when you deviate from it.
 - **Task list:** [`claude/tasks.md`](claude/tasks.md). Its tasks are designed to be done one per session, without prior context.
