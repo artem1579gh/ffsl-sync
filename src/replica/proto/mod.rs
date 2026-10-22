@@ -29,7 +29,7 @@ use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 
 /// The first bytes of every [`Hello`] and [`HelloReply`].
-pub const MAGIC: [u8; 8] = *b"fsync\x00wp";
+pub const MAGIC: [u8; 8] = *b"ffsl\x00\x00wp";
 
 /// The protocol version this build speaks best. Version 2 added the
 /// block-level delta transfer (`Blocks`, `ReadBlocks`, `ApplyDelta`);
@@ -110,7 +110,7 @@ pub fn client_handshake_upto<S: Read + Write + ?Sized>(
         .ok_or_else(|| refused("connection closed during the handshake"))?;
     match reply {
         HelloReply::Welcome { magic, .. } | HelloReply::Refused { magic, .. } if magic != MAGIC => {
-            Err(refused("not a files_sync server (bad magic)"))
+            Err(refused("not an ffsl-sync server (bad magic)"))
         }
         HelloReply::Refused { reason, .. } => Err(refused(format!(
             "server refused the session: {}",
@@ -161,7 +161,7 @@ pub fn server_handshake_upto<S: Read + Write + ?Sized>(
     let hello = read_frame::<_, Hello>(stream)?
         .ok_or_else(|| refused("connection closed before the handshake"))?;
     if hello.magic != MAGIC {
-        return Err(refused("not a files_sync client (bad magic)"));
+        return Err(refused("not an ffsl-sync client (bad magic)"));
     }
     let version = max_version.min(hello.max_version);
     let problem = if hello.min_version > hello.max_version {

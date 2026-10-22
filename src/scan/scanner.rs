@@ -3,7 +3,7 @@
 //!
 //! - **Traversal:** each child directory is opened from its parent's fd with
 //!   `openat2(RESOLVE_BENEATH | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV)` and
-//!   checked against the `statx` taken from the listing. Reserved `.~fsync.`
+//!   checked against the `statx` taken from the listing. Reserved `.~ffsl.`
 //!   names are skipped. The (dev, ino) of every directory on the current
 //!   traversal stack is kept, so a followed link back to an ancestor becomes
 //!   `Unmanaged(Loop)` instead of recursing forever.

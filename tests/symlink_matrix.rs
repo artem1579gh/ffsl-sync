@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use files_sync::config::SymlinkPolicy::{self, *};
-use files_sync::fs::RelPath;
-use files_sync::symlink::is_unsafe;
+use ffsl_sync::config::SymlinkPolicy::{self, *};
+use ffsl_sync::fs::RelPath;
+use ffsl_sync::symlink::is_unsafe;
 use harness::*;
 
 /// Base files' mtime (and the outside referents'): newer than [`OLD`].
@@ -532,7 +532,7 @@ fn copy_links_write_back(m: Mode) {
 fn followed_write_conflict_keeps_links(m: Mode) {
     let opts = Opts {
         policy: CopyLinks,
-        followed_write: files_sync::config::FollowedWrite::Conflict,
+        followed_write: ffsl_sync::config::FollowedWrite::Conflict,
         ..Opts::default()
     };
     let mut w = World::new(m, opts, opts);

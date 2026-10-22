@@ -6,10 +6,10 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::time::Duration;
 
-use files_sync::config::{ReplicaId, SymlinkPolicy};
-use files_sync::fs::{RelPath, Root};
-use files_sync::index::{Entry, IndexStore, Kind, Ord4, UnmanagedReason};
-use files_sync::scan::{ScanStats, Scanner, Scope};
+use ffsl_sync::config::{ReplicaId, SymlinkPolicy};
+use ffsl_sync::fs::{RelPath, Root};
+use ffsl_sync::index::{Entry, IndexStore, Kind, Ord4, UnmanagedReason};
+use ffsl_sync::scan::{ScanStats, Scanner, Scope};
 
 const ME: ReplicaId = ReplicaId(0x1234_5678_9abc_def0);
 /// Short racy window so tests can wait it out.
@@ -134,8 +134,8 @@ fn first_scan_under_links() {
     let fifo = std::ffi::CString::new(r.path("fifo").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
     // Reserved names are ignored, even directories full of stuff.
-    r.write(".~fsync.0123456789abcdef", b"temp");
-    r.mkdir(".~fsync.old.x/sub");
+    r.write(".~ffsl.0123456789abcdef", b"temp");
+    r.mkdir(".~ffsl.old.x/sub");
 
     let stats = r.scan(SymlinkPolicy::Links);
     assert!(
@@ -526,20 +526,20 @@ fn copy_dirlinks_and_unsafe_policies() {
     r.write("f", b"top");
     r.link("dl", "d");
     r.link("fl", "f");
-    r.link("d/esc", "../../no-such-fsync-dir");
+    r.link("d/esc", "../../no-such-ffsl-dir");
     r.scan(SymlinkPolicy::CopyDirlinks);
     assert_eq!(r.kind("dl"), Kind::Dir);
     assert_eq!(r.kind("dl/f"), file_kind(b"f"));
     assert_eq!(r.kind("fl"), link_kind(b"f"));
-    assert_eq!(r.kind("d/esc"), link_kind(b"../../no-such-fsync-dir"));
+    assert_eq!(r.kind("d/esc"), link_kind(b"../../no-such-ffsl-dir"));
     // `dl/esc` is the same link seen through `dl`.
-    assert_eq!(r.kind("dl/esc"), link_kind(b"../../no-such-fsync-dir"));
+    assert_eq!(r.kind("dl/esc"), link_kind(b"../../no-such-ffsl-dir"));
 
     let r = Replica::new();
     r.mkdir("d");
     r.write("x", b"x");
     r.link("d/safe", "../x");
-    r.link("d/unsafe", "../../no-such-fsync-file");
+    r.link("d/unsafe", "../../no-such-ffsl-file");
     r.scan(SymlinkPolicy::SafeLinks);
     assert_eq!(r.kind("d/safe"), link_kind(b"../x"));
     assert_eq!(

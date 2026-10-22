@@ -1,9 +1,9 @@
 //! Reserved names and conflict-copy names (design §2, §5.3, §6.2).
 //!
 //! Every name starting with [`RESERVED_PREFIX`] belongs to us: temp files
-//! (`.~fsync.<id>`), quarantined old inodes (`.~fsync.old.<id>`), files
-//! being deleted (`.~fsync.del.<id>`), capability probes
-//! (`.~fsync.probe.*`), the root marker (`.~fsync.root.<replica>`,
+//! (`.~ffsl.<id>`), quarantined old inodes (`.~ffsl.old.<id>`), files
+//! being deleted (`.~ffsl.del.<id>`), capability probes
+//! (`.~ffsl.probe.*`), the root marker (`.~ffsl.root.<replica>`,
 //! [`root_marker`]) and the trash directory ([`TRASH_DIR`]). The scanner and
 //! watcher ignore them all.
 //!
@@ -18,20 +18,20 @@ use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 
 /// Prefix of every name we create for our own bookkeeping.
-pub const RESERVED_PREFIX: &[u8] = b".~fsync.";
+pub const RESERVED_PREFIX: &[u8] = b".~ffsl.";
 
 /// Longest file name Linux filesystems accept.
 pub const NAME_MAX: usize = 255;
 
-/// True for names in the reserved `.~fsync.` namespace.
+/// True for names in the reserved `.~ffsl.` namespace.
 pub fn is_reserved(name: &[u8]) -> bool {
     name.starts_with(RESERVED_PREFIX)
 }
 
 /// Prefix of the root marker's name ([`root_marker`]).
-pub const ROOT_MARKER_PREFIX: &[u8] = b".~fsync.root.";
+pub const ROOT_MARKER_PREFIX: &[u8] = b".~ffsl.root.";
 
-/// `.~fsync.root.<replica>`: the file at the top of a replica root that
+/// `.~ffsl.root.<replica>`: the file at the top of a replica root that
 /// shows it is that replica's root (design §5.1). A replica refuses to sync
 /// a root without it once it has been made, so an empty directory in its
 /// place (a disk that is not mounted) is not taken for a replica whose
@@ -51,7 +51,7 @@ pub fn is_root_marker(name: &[u8]) -> bool {
 /// The trash directory at the top of a root (design §5.3 step 4(f), T31):
 /// with a replica's `trash_days` set, the old files its commits replace or
 /// delete are moved here instead of being unlinked, as [`trash_name`].
-pub const TRASH_DIR: &[u8] = b".~fsync.trash";
+pub const TRASH_DIR: &[u8] = b".~ffsl.trash";
 
 /// `stem~YYYYMMDD-HHMMSS.ext`: the name a replaced or deleted object `name`
 /// gets in the trash, `now` being the local time it was moved there. The
@@ -98,11 +98,11 @@ impl fmt::Display for TmpId {
 /// What a reserved name is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmpKind {
-    /// `.~fsync.<id>`: new content staged for a commit.
+    /// `.~ffsl.<id>`: new content staged for a commit.
     Temp,
-    /// `.~fsync.old.<id>`: a replaced inode in quarantine (§5.3 step 4(f)).
+    /// `.~ffsl.old.<id>`: a replaced inode in quarantine (§5.3 step 4(f)).
     Old,
-    /// `.~fsync.del.<id>`: an object being deleted (§5.6).
+    /// `.~ffsl.del.<id>`: an object being deleted (§5.6).
     Del,
 }
 
@@ -116,9 +116,9 @@ impl TmpKind {
     }
 }
 
-/// `.~fsync.<id>`, `.~fsync.old.<id>` or `.~fsync.del.<id>`.
+/// `.~ffsl.<id>`, `.~ffsl.old.<id>` or `.~ffsl.del.<id>`.
 pub fn name(kind: TmpKind, id: TmpId) -> Vec<u8> {
-    format!(".~fsync.{}{id}", kind.infix()).into_bytes()
+    format!(".~ffsl.{}{id}", kind.infix()).into_bytes()
 }
 
 pub fn tmp(id: TmpId) -> Vec<u8> {
@@ -208,7 +208,7 @@ fn with_marker(name: &[u8], split_ext: bool, marker: &str) -> Vec<u8> {
         (stem, ext) = (name, &[][..]);
     }
     let mut room = NAME_MAX - marker.len() - ext.len();
-    // `.~fsync` + `.sync-conflict-…` would be a reserved name, which the
+    // `.~ffsl` + `.sync-conflict-…` would be a reserved name, which the
     // scanner ignores and a commit refuses (issue #14): escaped with a `_`.
     let escape = is_reserved(&[&stem[..stem.len().min(room)], marker.as_bytes()].concat());
     if escape {
@@ -234,9 +234,9 @@ mod tests {
     #[test]
     fn reserved_names_round_trip() {
         let id = TmpId(0x0123_4567_89ab_cdef);
-        assert_eq!(tmp(id), b".~fsync.0123456789abcdef");
-        assert_eq!(old(id), b".~fsync.old.0123456789abcdef");
-        assert_eq!(del(id), b".~fsync.del.0123456789abcdef");
+        assert_eq!(tmp(id), b".~ffsl.0123456789abcdef");
+        assert_eq!(old(id), b".~ffsl.old.0123456789abcdef");
+        assert_eq!(del(id), b".~ffsl.del.0123456789abcdef");
         for kind in [TmpKind::Temp, TmpKind::Old, TmpKind::Del] {
             let n = name(kind, id);
             assert!(is_reserved(&n));
@@ -249,18 +249,18 @@ mod tests {
     fn parse_rejects_other_names() {
         for n in [
             &b"file"[..],
-            b".~fsync.",
-            b".~fsync.probe.0123456789abcdef.a",
-            b".~fsync.old.0123",
-            b".~fsync.0123456789ABCDEF",
-            b".~fsync.0123456789abcdef0",
-            b".~fsync.xyz.0123456789abcdef",
+            b".~ffsl.",
+            b".~ffsl.probe.0123456789abcdef.a",
+            b".~ffsl.old.0123",
+            b".~ffsl.0123456789ABCDEF",
+            b".~ffsl.0123456789abcdef0",
+            b".~ffsl.xyz.0123456789abcdef",
         ] {
             assert_eq!(parse(n), None, "{}", n.escape_ascii());
         }
-        assert!(is_reserved(b".~fsync.probe.x"));
-        assert!(!is_reserved(b".~fsync"));
-        assert!(!is_reserved(b"a.~fsync.x"));
+        assert!(is_reserved(b".~ffsl.probe.x"));
+        assert!(!is_reserved(b".~ffsl"));
+        assert!(!is_reserved(b"a.~ffsl.x"));
     }
 
     #[test]
@@ -277,10 +277,10 @@ mod tests {
     #[test]
     fn root_marker_names() {
         let name = root_marker(ReplicaId(0xabcdef0123456789));
-        assert_eq!(name, b".~fsync.root.abcdef0123456789");
+        assert_eq!(name, b".~ffsl.root.abcdef0123456789");
         assert!(is_reserved(&name) && is_root_marker(&name));
         assert_eq!(parse(&name), None);
-        assert!(!is_root_marker(b".~fsync.0123456789abcdef"));
+        assert!(!is_root_marker(b".~ffsl.0123456789abcdef"));
     }
 
     #[test]
@@ -308,14 +308,14 @@ mod tests {
         let id = ReplicaId(0xabcdef0123456789);
         let m = ".sync-conflict-20261002-090507-abcdef0";
         let c = |n: &[u8], split| conflict_name(n, split, now, id);
-        assert_eq!(c(b".~fsync", true), format!("_.~fsync{m}").as_bytes());
-        assert_eq!(c(b".~fsync", false), format!("_.~fsync{m}").as_bytes());
-        // Shortened to `.~fsync` to fit, with the longest extension kept.
-        let ext = [&b"."[..], &[b'e'; 255 - 38 - 7 - 1]].concat();
-        let n = c(&[&b".~fsyncXY"[..], &ext].concat(), true);
-        assert_eq!(n, [b"_.~fsyn", m.as_bytes(), &ext].concat());
+        assert_eq!(c(b".~ffsl", true), format!("_.~ffsl{m}").as_bytes());
+        assert_eq!(c(b".~ffsl", false), format!("_.~ffsl{m}").as_bytes());
+        // Shortened to `.~ffsl` to fit, with the longest extension kept.
+        let ext = [&b"."[..], &[b'e'; 255 - 38 - 6 - 1]].concat();
+        let n = c(&[&b".~ffslXY"[..], &ext].concat(), true);
+        assert_eq!(n, [b"_.~ffs", m.as_bytes(), &ext].concat());
         assert_eq!(n.len(), NAME_MAX);
-        for n in [&b".~fsync"[..], b".~fsyn", b".~fsync~", b".~fsyncx.y"] {
+        for n in [&b".~ffsl"[..], b".~ffs", b".~ffsl~", b".~ffslx.y"] {
             assert!(!is_reserved(&c(n, true)), "{}", n.escape_ascii());
             assert!(
                 !is_reserved(&trash_name(n, true, now)),

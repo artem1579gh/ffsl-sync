@@ -23,7 +23,7 @@
 //!   may it be in the directory the user moved it to;
 //! - an `Applied` or `Removed` outcome is true when the operation returns
 //!   (unless the attack ran after the final check);
-//! - no `.~fsync.*` names remain after a `Quarantine::sweep` with zero grace.
+//! - no `.~ffsl.*` names remain after a `Quarantine::sweep` with zero grace.
 //!
 //! Some operations also run in variants that reach the undo, restore and
 //! conflict paths: the user edits the target through a held fd just before
@@ -40,12 +40,12 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
-use files_sync::Result;
-use files_sync::config::ReplicaId;
-use files_sync::fs::caps::Caps;
-use files_sync::fs::commit::{self, CopyNode, Ctx, Expected, FileMeta, Outcome, Quarantine};
-use files_sync::fs::{Fingerprint, RelPath, Root, hooks, is_reserved, is_root_marker};
-use files_sync::index::Journal;
+use ffsl_sync::Result;
+use ffsl_sync::config::ReplicaId;
+use ffsl_sync::fs::caps::Caps;
+use ffsl_sync::fs::commit::{self, CopyNode, Ctx, Expected, FileMeta, Outcome, Quarantine};
+use ffsl_sync::fs::{Fingerprint, RelPath, Root, hooks, is_reserved, is_root_marker};
+use ffsl_sync::index::Journal;
 
 const REPLICA: ReplicaId = ReplicaId(0x0123456789abcdef);
 const TARGET: &str = "a/b/t";
@@ -451,7 +451,7 @@ fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
                 // by hash at the end.
                 let mut open = |rel: &RelPath| -> Result<Box<dyn std::io::Read>> {
                     let path = src.join(rel.as_os_str());
-                    let data = fs::read(&path).map_err(|e| files_sync::Error::io("read", e))?;
+                    let data = fs::read(&path).map_err(|e| ffsl_sync::Error::io("read", e))?;
                     Ok(Box::new(std::io::Cursor::new(data)))
                 };
                 commit::materialize(&ctx, q, &t, exp(), 0o750, &tree, &mut open)

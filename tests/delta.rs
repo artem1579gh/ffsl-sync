@@ -8,10 +8,10 @@ use std::fs;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use files_sync::config::SymlinkPolicy;
-use files_sync::engine::Engine;
-use files_sync::replica::BLOCK_SIZE;
-use files_sync::replica::proto::PROTOCOL_VERSION;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::engine::Engine;
+use ffsl_sync::replica::BLOCK_SIZE;
+use ffsl_sync::replica::proto::PROTOCOL_VERSION;
 use harness::{Mode, Pair};
 
 const MIB: usize = 1 << 20;
@@ -139,7 +139,7 @@ fn v1_sessions_send_whole_files() {
 #[cfg(feature = "hooks")]
 #[test]
 fn destination_changed_mid_assembly_commits_nothing() {
-    use files_sync::fs::hooks;
+    use ffsl_sync::fs::hooks;
 
     let mut p = Pair::new(SymlinkPolicy::Links).over_each([Mode::Remote, Mode::Local], [V2, V2]);
     p.engine = Engine::new();

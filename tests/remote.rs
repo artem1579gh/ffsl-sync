@@ -11,16 +11,16 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use files_sync::Error;
-use files_sync::config::{self, PairConfig, ReplicaId};
-use files_sync::daemon::Daemon;
-use files_sync::engine::Engine;
-use files_sync::fs::RelPath;
-use files_sync::index::Kind;
-use files_sync::replica::{LocalReplica, RemoteReplica, Replica};
-use files_sync::server::{Server, ServerHandle};
-use files_sync::tls::{DeviceId, Identity};
-use files_sync::watch::Hint;
+use ffsl_sync::Error;
+use ffsl_sync::config::{self, PairConfig, ReplicaId};
+use ffsl_sync::daemon::Daemon;
+use ffsl_sync::engine::Engine;
+use ffsl_sync::fs::RelPath;
+use ffsl_sync::index::Kind;
+use ffsl_sync::replica::{LocalReplica, RemoteReplica, Replica};
+use ffsl_sync::server::{Server, ServerHandle};
+use ffsl_sync::tls::{DeviceId, Identity};
+use ffsl_sync::watch::Hint;
 use tempfile::TempDir;
 
 struct Net {
@@ -105,7 +105,7 @@ fn tree(root: &Path) -> BTreeMap<Vec<u8>, Node> {
         for e in fs::read_dir(dir).unwrap() {
             let e = e.unwrap();
             let name = e.file_name();
-            if name.as_bytes().starts_with(b".~fsync.") {
+            if name.as_bytes().starts_with(b".~ffsl.") {
                 continue;
             }
             let mut path = rel.to_vec();
@@ -186,7 +186,7 @@ fn remote_index_and_reads() {
     fs::write(rb.join("small"), b"0123456789").unwrap();
     fs::write(rb.join("large"), big(3 << 20, 3)).unwrap();
     let mut b = net.b();
-    b.scan(files_sync::scan::Scope::Full).unwrap();
+    b.scan(ffsl_sync::scan::Scope::Full).unwrap();
     let changes = b.changes_since(0).unwrap();
     let seqs: Vec<u64> = changes.iter().map(|(_, e)| e.seq).collect();
     assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
@@ -246,7 +246,7 @@ fn remote_index_and_reads() {
     let err = b
         .open_read(
             &small,
-            &files_sync::index::Entry::new(Kind::Dir, 0o755, 0, Default::default()),
+            &ffsl_sync::index::Entry::new(Kind::Dir, 0o755, 0, Default::default()),
         )
         .err()
         .unwrap();
@@ -323,7 +323,7 @@ fn hints_are_pushed_and_survive_reconnects() {
         &rx,
         |h| matches!(h, Hint::Paths(p) if p.iter().any(|p| p.as_bytes() == b"newer")),
     );
-    b.scan(files_sync::scan::Scope::Full).unwrap();
+    b.scan(ffsl_sync::scan::Scope::Full).unwrap();
     assert_eq!(b.connections(), 2);
 }
 

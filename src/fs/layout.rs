@@ -211,21 +211,21 @@ mod tests {
     fn state_directory_inside_or_around_the_root() {
         let t = tempfile::tempdir().unwrap();
         let (root, state) = (t.path().join("root"), t.path().join("state"));
-        fs::create_dir_all(root.join(".local/state/fsync/p")).unwrap();
+        fs::create_dir_all(root.join(".local/state/ffsl-sync/p")).unwrap();
         fs::create_dir_all(state.join("p/inner")).unwrap();
         assert_eq!(reason(&root, &state.join("p"), None), None);
 
-        let r = reason(&root, &root.join(".local/state/fsync/p"), None).unwrap();
+        let r = reason(&root, &root.join(".local/state/ffsl-sync/p"), None).unwrap();
         assert!(r.starts_with("contains the state directory"), "{r}");
         // A symlinked state home does not hide it.
         symlink(root.join(".local/state"), t.path().join("xdg")).unwrap();
-        let r = reason(&root, &t.path().join("xdg/fsync/p"), None).unwrap();
+        let r = reason(&root, &t.path().join("xdg/ffsl-sync/p"), None).unwrap();
         assert!(r.starts_with("contains the state directory"), "{r}");
         // Nor a symlinked root.
         symlink(&root, t.path().join("home")).unwrap();
         let r = reason(
             &t.path().join("home"),
-            &root.join(".local/state/fsync/p"),
+            &root.join(".local/state/ffsl-sync/p"),
             None,
         )
         .unwrap();

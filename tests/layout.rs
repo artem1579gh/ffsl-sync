@@ -9,10 +9,10 @@ use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use files_sync::config::PairConfig;
+use ffsl_sync::config::PairConfig;
 
 fn bin(state_home: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_files_sync"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ffsl-sync"));
     cmd.args(args)
         .env("XDG_STATE_HOME", state_home)
         .env_remove("RUST_LOG");
@@ -85,7 +85,7 @@ fn serve_refuses_a_root_that_holds_its_state_directory() {
         !e.unwrap()
             .file_name()
             .to_string_lossy()
-            .starts_with(".~fsync.root.")
+            .starts_with(".~ffsl.root.")
     }));
 }
 
@@ -120,7 +120,7 @@ fn sync_refuses_a_state_directory_behind_a_symlink() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        names.len() == 1 && names[0].starts_with(".~fsync.root."),
+        names.len() == 1 && names[0].starts_with(".~ffsl.root."),
         "{names:?}"
     );
 }

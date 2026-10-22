@@ -1,6 +1,6 @@
 //! The intent journal (design §5.3 step 1, §5.8).
 //!
-//! A commit that creates reserved (`.~fsync.*`) names first records an
+//! A commit that creates reserved (`.~ffsl.*`) names first records an
 //! [`Intent`] here, in the replica's index database, and commits it durably.
 //! The intent names every reserved name the commit may use (chosen up front)
 //! and, once known, the identity of the objects involved. After a crash,
@@ -311,8 +311,8 @@ mod tests {
             op,
             path: RelPath::new(&b"d/f\xff"[..]).unwrap(),
             parent: fp(2),
-            tmp: b".~fsync.0123456789abcdef".to_vec(),
-            old: Some(b".~fsync.old.0123456789abcdef".to_vec()),
+            tmp: b".~ffsl.0123456789abcdef".to_vec(),
+            old: Some(b".~ffsl.old.0123456789abcdef".to_vec()),
             expected: Some(Expected {
                 fp: fp(3),
                 hash: Some([7; 32]),

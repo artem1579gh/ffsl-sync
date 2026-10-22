@@ -2,11 +2,11 @@ use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match files_sync::cli::run() {
+    match ffsl_sync::cli::run() {
         // Output was cut short by the reader (e.g. `status | head`): quiet,
         // with the status a shell shows for a process killed by SIGPIPE.
-        Ok(()) if files_sync::cli::stdout_closed() => {
-            ExitCode::from(files_sync::cli::EXIT_STDOUT_CLOSED)
+        Ok(()) if ffsl_sync::cli::stdout_closed() => {
+            ExitCode::from(ffsl_sync::cli::EXIT_STDOUT_CLOSED)
         }
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

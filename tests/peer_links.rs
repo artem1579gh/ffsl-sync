@@ -13,11 +13,11 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use files_sync::config::SymlinkPolicy::{self, *};
-use files_sync::fs::commit::FileMeta;
-use files_sync::index::{Entry, Kind, VersionVector};
-use files_sync::replica::{Op, Outcome, Precondition, Replica};
-use files_sync::scan::Scope;
+use ffsl_sync::config::SymlinkPolicy::{self, *};
+use ffsl_sync::fs::commit::FileMeta;
+use ffsl_sync::index::{Entry, Kind, VersionVector};
+use ffsl_sync::replica::{Op, Outcome, Precondition, Replica};
+use ffsl_sync::scan::Scope;
 use harness::*;
 
 /// A case's directory `P`: the roots `a/` and `b/`, the state directory,
@@ -60,7 +60,7 @@ fn munged(target: &str) -> String {
     format!("/rsyncd-munged/{target}")
 }
 
-fn vv_of(id: files_sync::config::ReplicaId) -> VersionVector {
+fn vv_of(id: ffsl_sync::config::ReplicaId) -> VersionVector {
     let mut vv = VersionVector::new();
     vv.bump(id);
     vv
@@ -89,12 +89,7 @@ fn contents(root: &Path) -> Vec<String> {
     while let Some(dir) = stack.pop() {
         for e in fs::read_dir(&dir).unwrap() {
             let path = e.unwrap().path();
-            if path
-                .file_name()
-                .unwrap()
-                .as_bytes()
-                .starts_with(b".~fsync.")
-            {
+            if path.file_name().unwrap().as_bytes().starts_with(b".~ffsl.") {
                 continue;
             }
             let md = path.symlink_metadata().unwrap();
@@ -162,7 +157,7 @@ fn planted_link_is_not_followed(m: Mode) {
             let read = b.open_read(&rp("x"), &forged).and_then(|mut r| {
                 let mut s = String::new();
                 r.read_to_string(&mut s)
-                    .map_err(|e| files_sync::Error::io("read", e))?;
+                    .map_err(|e| ffsl_sync::Error::io("read", e))?;
                 Ok(s)
             });
             assert!(read.is_err(), "{policy:?}: {read:?}");

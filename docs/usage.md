@@ -1,6 +1,6 @@
-# files_sync user guide
+# ffsl-sync user guide
 
-`files_sync` keeps two directories identical in both directions: edit either one, and the change shows up in the other. It is built to stay correct while other programs are changing files during a sync, and it handles symlinks the way `rsync` does.
+`ffsl-sync` keeps two directories identical in both directions: edit either one, and the change shows up in the other. It is built to stay correct while other programs are changing files during a sync, and it handles symlinks the way `rsync` does.
 
 This guide covers:
 
@@ -26,20 +26,45 @@ You need:
 - A Rust toolchain that supports edition 2024 (Rust 1.85 or newer).
 
 ```bash
-git clone <this repository> files_sync
-cd files_sync
+git clone <this repository> ffsl-sync
+cd ffsl-sync
 cargo build --release
-# The binary is target/release/files_sync. Put it on your PATH, e.g.:
+# The binary is target/release/ffsl-sync. Put it on your PATH, e.g.:
 cargo install --path .
 ```
 
-Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpfs. Network filesystems and WSL's `/mnt/c` (drvfs) are not supported, because they lack the kernel features the safe write path needs (`O_TMPFILE`, `RENAME_EXCHANGE`, leases, reliable inotify). `files_sync` checks this when it opens a replica and refuses to run if a required feature is missing.
+Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpfs. Network filesystems and WSL's `/mnt/c` (drvfs) are not supported, because they lack the kernel features the safe write path needs (`O_TMPFILE`, `RENAME_EXCHANGE`, leases, reliable inotify). `ffsl-sync` checks this when it opens a replica and refuses to run if a required feature is missing.
+
+### Upgrading from `files_sync` 0.1.x
+
+Up to 0.1.15 the program was called `files_sync`. Version 0.2.1 renamed it, and with it the names it keeps on disk and on the wire. The binary is now `ffsl-sync`, the state directory is `$XDG_STATE_HOME/ffsl-sync/` (was `.../fsync/`), and the reserved prefix is `.~ffsl.` (was `.~fsync.`). It also no longer talks to an old `serve`, nor an old client to it (`bad magic`), so upgrade both hosts of a network pair together. To carry a pair over, on every host that runs one of its replicas:
+
+```bash
+# 1. With the old binary: stop every daemon and serve of the pair, then run a last
+#    one-shot sync (start the old serve for it, and stop it again afterwards).
+#    It leaves no reserved files behind but the root marker and the trash.
+files_sync sync --once docs
+
+# 2. Move the state directory.
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}
+mv "$STATE/fsync" "$STATE/ffsl-sync"
+
+# 3. In each replica root on this host: rename the root marker and the trash.
+cd /data/backup
+for f in .~fsync.root.*; do mv -n -- "$f" ".~ffsl.root.${f#.~fsync.root.}"; done
+[ -e .~fsync.trash ] && mv -n .~fsync.trash .~ffsl.trash
+find . -name '.~fsync.*'     # should print nothing
+
+# 4. Install the new binary and start the daemons and serve again.
+```
+
+Anything step 3's `find` still prints is no longer reserved, and the next sync would copy it to the other side like an ordinary file; delete it first. Steps you skip do no harm: without step 2 the new binary does not know the pair, and without step 3 it refuses the root because its marker is missing ([§2](#2-concepts)), so nothing is deleted.
 
 ## 2. Concepts
 
 - **Pair:** two directories that are kept in sync. A pair has a name, such as `docs`.
 - **Replica:** one of the two directories, called **A** and **B**. They are equal peers: neither is the "source". Each has a random 16-hex-digit **replica ID**.
-- **State directory:** `$XDG_STATE_HOME/fsync/<pair>/`, or `~/.local/state/fsync/<pair>/` if `XDG_STATE_HOME` is unset. It holds:
+- **State directory:** `$XDG_STATE_HOME/ffsl-sync/<pair>/`, or `~/.local/state/ffsl-sync/<pair>/` if `XDG_STATE_HOME` is unset. It holds:
   - `config.toml`, the pair's settings ([§10](#10-config-file-reference));
   - `<replica-id>.redb`, the index (what was last seen and synced) and the crash-recovery journal of each local replica;
   - `<replica-id>.crt` / `.key`, a TLS identity (certificate and private key) per replica, used only for network sync. A host holds the identity of each replica it runs, and not the one of a replica served elsewhere ([§7](#7-syncing-over-the-network));
@@ -47,16 +72,16 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
 
   The state directory never lives inside a replica. `init` refuses such a pair, and `sync`, `daemon` and `serve` check again each time they open a replica, by the directories themselves, so symlinks do not hide it. This matters most on a server: serving your home directory with the default state directory (`~/.local/state`) inside it is refused, since it would sync the replica's private key and never stop syncing its own status reports. Point `XDG_STATE_HOME` elsewhere, or serve a subdirectory.
 - **Version vectors:** per-file causal history, as in syncthing. They tell an ordinary update ("B has seen A's last change and edited it again") from a real conflict ("both sides changed the file independently").
-- **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker and the trash below are the ones that stay.
-- **Root marker:** the first sync puts a small file `.~fsync.root.<replica-id>` at the top of each local root, saying which replica the directory is. Like syncthing's `.stfolder`, it guards against an empty directory standing in for the replica. That happens, for example, when the disk behind a root is not mounted and its empty mount point is left. Without the marker, every file in the index would look deleted, and the deletions would be synced to the other side. If the marker is missing, `sync`, `daemon` and `serve` refuse to run for the pair (a daemon whose root loses its marker stops): ``replica root …: its root marker is missing; it may not be the replica's directory (is its disk mounted?)``. To fix it:
+- **Reserved names:** names starting with `.~ffsl.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker and the trash below are the ones that stay.
+- **Root marker:** the first sync puts a small file `.~ffsl.root.<replica-id>` at the top of each local root, saying which replica the directory is. Like syncthing's `.stfolder`, it guards against an empty directory standing in for the replica. That happens, for example, when the disk behind a root is not mounted and its empty mount point is left. Without the marker, every file in the index would look deleted, and the deletions would be synced to the other side. If the marker is missing, `sync`, `daemon` and `serve` refuse to run for the pair (a daemon whose root loses its marker stops): ``replica root …: its root marker is missing; it may not be the replica's directory (is its disk mounted?)``. To fix it:
   - if the disk is not mounted, or the path is wrong, mount it or fix the path, and run again;
-  - if the directory really is the replica (say, you restored it from a backup that skipped the marker), create the marker yourself, e.g. `touch '/data/backup/.~fsync.root.b8585899415ed538'`. Its content does not matter. The next sync then treats whatever is missing from the directory as deleted, and deletes it on the other side too;
+  - if the directory really is the replica (say, you restored it from a backup that skipped the marker), create the marker yourself, e.g. `touch '/data/backup/.~ffsl.root.b8585899415ed538'`. Its content does not matter. The next sync then treats whatever is missing from the directory as deleted, and deletes it on the other side too;
   - to fill an empty directory from the other side instead, delete this replica's index `<replica-id>.redb` from the state directory (only while nothing runs for the pair). The replica then starts over: the next sync copies the other side's files into it and deletes nothing.
 
   A pair made before root markers gets its markers on its next sync, unless a root is empty while its index lists files: that is refused in the same way.
 - **Lost or restored index:** if a replica's index `<replica-id>.redb` is deleted, or replaced by an older copy from a backup, nothing is lost. Before each sync the two replicas compare their version clocks, so the replica's changes since its last sync still count as newer than what the other side has. Where the other side has not changed a file since, the replica's version is copied there; where it has, the file becomes a conflict copy ([§4](#4-conflicts)). The replica only forgets what it deleted since its last sync: those files come back from the other side. A deleted index logs a warning: ``this replica was synced before, but its index is new (lost or deleted?): …``. Over the network, a `serve` from before this fix (0.1.2 or older) still syncs, but its own replica's index is not covered.
   Back up the marker with the rest of the directory, and keep it there. Since there is one marker per replica ID, a directory can be a replica of several pairs.
-- **Trash (optional):** by default, a file that a sync replaces or deletes is gone shortly afterwards. It is unlinked once no program has it open for writing any more (or, on a filesystem without leases, after a short grace period). If someone writes to it in the meantime, or still has it open for writing a minute later, it is kept as a conflict copy instead ([§4](#4-conflicts)). Set `trash_days` on a replica ([§10](#10-config-file-reference)) to keep such files in its trash, `.~fsync.trash` at the top of its root, for that many days. They keep their directory path there, with the time they were moved in added to the name, e.g. `.~fsync.trash/reports/q3~20261005-091139.pdf`. A sync never looks inside the trash. Files are removed once older than `trash_days`, checked about once an hour while a `sync`, `daemon` or `serve` runs. Restore a file by copying or moving it back. The trash is on the replica's own disk, so it takes space there. A file beneath a `keep_dirlinks` link to another filesystem cannot be moved there, and is removed as without a trash.
+- **Trash (optional):** by default, a file that a sync replaces or deletes is gone shortly afterwards. It is unlinked once no program has it open for writing any more (or, on a filesystem without leases, after a short grace period). If someone writes to it in the meantime, or still has it open for writing a minute later, it is kept as a conflict copy instead ([§4](#4-conflicts)). Set `trash_days` on a replica ([§10](#10-config-file-reference)) to keep such files in its trash, `.~ffsl.trash` at the top of its root, for that many days. They keep their directory path there, with the time they were moved in added to the name, e.g. `.~ffsl.trash/reports/q3~20261005-091139.pdf`. A sync never looks inside the trash. Files are removed once older than `trash_days`, checked about once an hour while a `sync`, `daemon` or `serve` runs. Restore a file by copying or moving it back. The trash is on the replica's own disk, so it takes space there. A file beneath a `keep_dirlinks` link to another filesystem cannot be moved there, and is removed as without a trash.
 - **Mass-deletion guard:** a second safety net, like unison's `confirmbigdeletes`. If one sync would delete more than half of a replica's entries (`max_delete_percent` in [§10](#10-config-file-reference)), and more than 10 of them, none of those deletions is applied there. Everything else is still synced. The deleting side keeps its deletions, so nothing comes back either:
 
   ```text
@@ -68,18 +93,18 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
       photos/img11.jpg
       photos/img12.jpg
       … and 36 more
-      if these deletions are intended, apply them with: files_sync sync --once --allow-mass-delete docs
+      if these deletions are intended, apply them with: ffsl-sync sync --once --allow-mass-delete docs
   Error: 41 path(s) not synced; see above
   ```
 
-  `sync --once` then exits with status 1, and every later sync holds them back again. If you meant to delete them, run `files_sync sync --once --allow-mass-delete docs`. If not, restore the files on the side that lost them, from the other side for example. A `daemon` holds them back too, logs a warning, and keeps running; stop it to run `sync --once --allow-mass-delete`, then start it again. Deleting at most 10 entries, or at most half of them, is never held back.
+  `sync --once` then exits with status 1, and every later sync holds them back again. If you meant to delete them, run `ffsl-sync sync --once --allow-mass-delete docs`. If not, restore the files on the side that lost them, from the other side for example. A `daemon` holds them back too, logs a warning, and keeps running; stop it to run `sync --once --allow-mass-delete`, then start it again. Deleting at most 10 entries, or at most half of them, is never held back.
 
 ## 3. Quick start
 
 Set up a scratch area. `XDG_STATE_HOME` points into it, so this demo keeps its pair configs out of `~/.local/state`. `RUST_LOG=warn` hides the informational log lines; see [§8](#8-sandboxing-and-logging).
 
 ```sh
-export DEMO=/tmp/fsync-demo
+export DEMO=/tmp/ffsl-sync-demo
 rm -rf "$DEMO" && mkdir -p "$DEMO" && cd "$DEMO"
 export XDG_STATE_HOME="$DEMO/state"
 export RUST_LOG=warn
@@ -97,22 +122,22 @@ printf 'jpegdata' > laptop/photos/cat.jpg
 Create the pair. Roots must be existing directories, and must not be nested in each other:
 
 ```sh
-files_sync init docs --a "$DEMO/laptop" --b "$DEMO/backup"
+ffsl-sync init docs --a "$DEMO/laptop" --b "$DEMO/backup"
 ```
 
 ```text
-initialised pair "docs": /tmp/fsync-demo/state/fsync/docs/config.toml
-  a: /tmp/fsync-demo/laptop (replica f563ef689fcf91de)
+initialised pair "docs": /tmp/ffsl-sync-demo/state/ffsl-sync/docs/config.toml
+  a: /tmp/ffsl-sync-demo/laptop (replica f563ef689fcf91de)
      device cdfacff3cbc46bbb14e403cc328caae6c0551ae189a13a70ddd8cbd1c24c90d3
-  b: /tmp/fsync-demo/backup (replica b8585899415ed538)
+  b: /tmp/ffsl-sync-demo/backup (replica b8585899415ed538)
      device 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
 ```
 
 (Your IDs will differ.) Run a one-shot sync:
 
 ```sh
-files_sync sync --once docs
-find backup -not -name '.~fsync.*' | sort
+ffsl-sync sync --once docs
+find backup -not -name '.~ffsl.*' | sort
 ```
 
 ```text
@@ -123,14 +148,14 @@ backup/photos
 backup/photos/cat.jpg
 ```
 
-`find` leaves out the root marker `.~fsync.root.<replica-id>` that the sync put in each root (see [§2](#2-concepts)).
+`find` leaves out the root marker `.~ffsl.root.<replica-id>` that the sync put in each root (see [§2](#2-concepts)).
 
 Now change things on **both** sides: append to a file in `backup`, and delete a file in `laptop`. One sync carries each change to the other side.
 
 ```sh
 echo "edited on backup" >> backup/notes.txt
 rm laptop/photos/cat.jpg
-files_sync sync --once docs
+ffsl-sync sync --once docs
 cat laptop/notes.txt
 ls backup/photos
 ```
@@ -144,19 +169,19 @@ edited on backup
 (`backup/photos` is now empty.) A sync with nothing to do applies nothing:
 
 ```sh
-files_sync sync --once docs
-files_sync status docs
+ffsl-sync sync --once docs
+ffsl-sync status docs
 ```
 
 ```text
 synced "docs": 0 change(s) applied in 0 round(s)
 pair "docs"
-  a: /tmp/fsync-demo/laptop (replica f563ef689fcf91de)
+  a: /tmp/ffsl-sync-demo/laptop (replica f563ef689fcf91de)
     index:       3 entries (1 tombstones)
     conflicts:   0
     quarantined: 0
     last sync:   2026-10-02 23:54:16 CEST
-  b: /tmp/fsync-demo/backup (replica b8585899415ed538)
+  b: /tmp/ffsl-sync-demo/backup (replica b8585899415ed538)
     index:       3 entries (1 tombstones)
     conflicts:   0
     quarantined: 0
@@ -171,26 +196,26 @@ A **tombstone** is how a replica remembers a deletion. It keeps a deleted file f
 
 A conflict happens when the same file was changed on both sides since the last sync. Nothing is lost:
 - The version with the **newer modification time wins** and keeps the name. On a tie, the replica with the higher ID wins.
-- The other version is renamed to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 hex digits of the losing replica's ID. A name that would then start with `.~fsync.` (a file named exactly `.~fsync`) gets a `_` in front: `_.~fsync.sync-conflict-…`. Version 0.1.14 and older failed to make such a conflict copy on every sync (issue #14).
+- The other version is renamed to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 hex digits of the losing replica's ID. A name that would then start with `.~ffsl.` (a file named exactly `.~ffsl`) gets a `_` in front: `_.~ffsl.sync-conflict-…`. Version 0.1.14 and older failed to make such a conflict copy on every sync (issue #14).
 - Both files then exist on **both** sides.
 
 ```sh
 mkdir a b
 echo v1 > a/report.txt
-files_sync init conflict-demo --a "$DEMO/a" --b "$DEMO/b"
-files_sync sync --once conflict-demo
+ffsl-sync init conflict-demo --a "$DEMO/a" --b "$DEMO/b"
+ffsl-sync sync --once conflict-demo
 
 echo "edit from A" > a/report.txt
 sleep 1                          # make B's edit clearly newer
 echo "edit from B" > b/report.txt
-files_sync sync --once conflict-demo
+ffsl-sync sync --once conflict-demo
 ls a b
 cat a/report.txt a/report.sync-conflict-*
 ```
 
 ```text
 synced "conflict-demo": 4 change(s) applied in 2 round(s)
-  conflict at report.txt: the version in /tmp/fsync-demo/a is kept as report.sync-conflict-20261002-235427-3d37213.txt
+  conflict at report.txt: the version in /tmp/ffsl-sync-demo/a is kept as report.sync-conflict-20261002-235427-3d37213.txt
 a:
 report.sync-conflict-20261002-235427-3d37213.txt
 report.txt
@@ -202,7 +227,7 @@ edit from B
 edit from A
 ```
 
-`files_sync status` lists the conflict copies that exist in each replica. To resolve a conflict, merge the content by hand and delete the conflict copy; the deletion syncs like any other.
+`ffsl-sync status` lists the conflict copies that exist in each replica. To resolve a conflict, merge the content by hand and delete the conflict copy; the deletion syncs like any other.
 
 Other conflict rules:
 - **Edit vs. delete:** the edit wins. The deleted file comes back with the new content.
@@ -214,14 +239,14 @@ Other conflict rules:
 
 ## 5. Continuous sync with the daemon
 
-`files_sync daemon <pair>` watches both replicas with inotify and syncs each change within a fraction of a second. It also runs a full rescan every 10 minutes as a backstop. It stops cleanly on Ctrl-C (SIGINT) or SIGTERM.
+`ffsl-sync daemon <pair>` watches both replicas with inotify and syncs each change within a fraction of a second. It also runs a full rescan every 10 minutes as a backstop. It stops cleanly on Ctrl-C (SIGINT) or SIGTERM.
 
 Usually you run it in its own terminal, or as a service. Here it runs in the background:
 
 ```sh
 mkdir -p d/a d/b
-files_sync init live --a "$DEMO/d/a" --b "$DEMO/d/b"
-files_sync daemon live &
+ffsl-sync init live --a "$DEMO/d/a" --b "$DEMO/d/b"
+ffsl-sync daemon live &
 sleep 1
 
 echo "hello from A" > d/a/todo.txt
@@ -239,12 +264,12 @@ code
 While the daemon runs, it holds the replicas' indexes, so `status` shows the report the daemon saved after its latest cycle:
 
 ```sh
-files_sync status live
+ffsl-sync status live
 ```
 
 ```text
 pair "live" (daemon running; its report from 2026-10-02 23:55:02 CEST)
-  a: /tmp/fsync-demo/d/a (replica ae9d6d20ded92206)
+  a: /tmp/ffsl-sync-demo/d/a (replica ae9d6d20ded92206)
     index:       4 entries (0 tombstones)
   ...
 ```
@@ -295,7 +320,7 @@ Under the following policies, an incoming change to a followed link replaces the
 
 An incoming change *beneath* a followed directory link first turns the link into a real copy of the directory. What is not synced in it (dangling links, link loops, FIFOs) is left out of the copy. The other side's files at those paths are not deleted: they are copied into the new directory.
 
-The `files_sync` process can never be tricked into writing outside a replica root, whatever the links point to. This is enforced by the kernel (`openat2` with `RESOLVE_BENEATH`), not by the policy.
+The `ffsl-sync` process can never be tricked into writing outside a replica root, whatever the links point to. This is enforced by the kernel (`openat2` with `RESOLVE_BENEATH`), not by the policy.
 
 ### Links from the other replica
 
@@ -328,11 +353,11 @@ For each policy, make a pair, set the policy on both replicas, sync, and list wh
 for policy in links skip copy-links copy-unsafe-links safe-links copy-dirlinks; do
   mkdir -p "sl-$policy/b"
   make_tree "$DEMO/sl-$policy/a"
-  files_sync init "sl-$policy" --a "$DEMO/sl-$policy/a" --b "$DEMO/sl-$policy/b" > /dev/null
-  sed -i "s/^symlinks = .*/symlinks = \"$policy\"/" "$XDG_STATE_HOME/fsync/sl-$policy/config.toml"
-  files_sync sync --once "sl-$policy" > /dev/null
+  ffsl-sync init "sl-$policy" --a "$DEMO/sl-$policy/a" --b "$DEMO/sl-$policy/b" > /dev/null
+  sed -i "s/^symlinks = .*/symlinks = \"$policy\"/" "$XDG_STATE_HOME/ffsl-sync/sl-$policy/config.toml"
+  ffsl-sync sync --once "sl-$policy" > /dev/null
   echo "== $policy"
-  (cd "sl-$policy/b" && find . -mindepth 1 -not -name '.~fsync.*' -printf '%y %p %l\n' | sort)
+  (cd "sl-$policy/b" && find . -mindepth 1 -not -name '.~ffsl.*' -printf '%y %p %l\n' | sort)
 done
 ```
 
@@ -352,11 +377,11 @@ The result (`d` directory, `f` file, `l` symlink with its target):
 ```sh
 mkdir -p m/a m/b
 ln -s /etc/hostname m/a/host
-files_sync init munge --a "$DEMO/m/a" --b "$DEMO/m/b" > /dev/null
+ffsl-sync init munge --a "$DEMO/m/a" --b "$DEMO/m/b" > /dev/null
 # set munge_links = true on replica B (the second [[replicas]] table)
 awk '/^\[\[replicas\]\]/ { n++ } n == 2 && /^munge_links/ { $0 = "munge_links = true" } { print }' \
-  "$XDG_STATE_HOME/fsync/munge/config.toml" > cfg.tmp && mv cfg.tmp "$XDG_STATE_HOME/fsync/munge/config.toml"
-files_sync sync --once munge
+  "$XDG_STATE_HOME/ffsl-sync/munge/config.toml" > cfg.tmp && mv cfg.tmp "$XDG_STATE_HOME/ffsl-sync/munge/config.toml"
+ffsl-sync sync --once munge
 readlink m/a/host m/b/host
 ```
 
@@ -372,7 +397,7 @@ Under `copy-links`, B got `safe-link` as a plain file. If B edits it, A's link i
 
 ```sh
 echo "new content" > sl-copy-links/b/safe-link
-files_sync sync --once sl-copy-links
+ffsl-sync sync --once sl-copy-links
 ls -l sl-copy-links/a/safe-link
 cat sl-copy-links/a/safe-link sl-copy-links/a/docs/readme.txt
 ```
@@ -386,56 +411,56 @@ readme
 
 ## 7. Syncing over the network
 
-A replica can live on another host. There, `files_sync serve` runs it and answers its peer over TLS 1.3. Both sides authenticate with self-signed certificates whose hashes (device IDs) are pinned in the config, as in syncthing: no CA, no passwords. Each certificate is made on the host that uses it, and its private key never leaves that host. Each host keeps its own replica's index in its own state directory. When a file that both sides already have changes, and it is at least 1 MiB, only the changed 128 KiB blocks are sent. Symlinks that come over the network cannot lead out of a replica root that follows links ([Links from the other replica](#links-from-the-other-replica)). The server's error messages are printed with their control characters escaped (as `\u{1b}`, say), so a server cannot drive your terminal.
+A replica can live on another host. There, `ffsl-sync serve` runs it and answers its peer over TLS 1.3. Both sides authenticate with self-signed certificates whose hashes (device IDs) are pinned in the config, as in syncthing: no CA, no passwords. Each certificate is made on the host that uses it, and its private key never leaves that host. Each host keeps its own replica's index in its own state directory. When a file that both sides already have changes, and it is at least 1 MiB, only the changed 128 KiB blocks are sent. Symlinks that come over the network cannot lead out of a replica root that follows links ([Links from the other replica](#links-from-the-other-replica)). The server's error messages are printed with their control characters escaped (as `\u{1b}`, say), so a server cannot drive your terminal.
 
 ### Deployment
 
 On the host that will run `sync`/`daemon` (here "laptop"), create the pair. Give B's address with `--b-remote`; `--b` is then the path **on the server**:
 
 ```bash
-files_sync init paper --a ~/work --b /srv/mirror --b-remote server.example:7777
+ffsl-sync init paper --a ~/work --b /srv/mirror --b-remote server.example:7777
 ```
 
-`init` makes A's identity on the laptop, but not B's: B's private key is made on the server, and only its device ID comes back. Copy `config.toml` (it holds no secrets) to the same state directory on the server (`~/.local/state/fsync/paper/`, or the one under `$XDG_STATE_HOME`). That state directory must not lie inside B's root: `serve` refuses to start if it does.
+`init` makes A's identity on the laptop, but not B's: B's private key is made on the server, and only its device ID comes back. Copy `config.toml` (it holds no secrets) to the same state directory on the server (`~/.local/state/ffsl-sync/paper/`, or the one under `$XDG_STATE_HOME`). That state directory must not lie inside B's root: `serve` refuses to start if it does.
 
 On the server, make B's identity. This prints its device ID:
 
 ```bash
-files_sync identity paper b
+ffsl-sync identity paper b
 ```
 
 ```text
-replica b of "paper" (c9c5677860a0d25b): new identity in /home/you/.local/state/fsync/paper/c9c5677860a0d25b.key
+replica b of "paper" (c9c5677860a0d25b): new identity in /home/you/.local/state/ffsl-sync/paper/c9c5677860a0d25b.key
   device 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
-  on the host that syncs the pair, pin it with: files_sync pin paper b 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
+  on the host that syncs the pair, pin it with: ffsl-sync pin paper b 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
 ```
 
 On the laptop, pin it, as printed. Both copies of the config are then the same:
 
 ```bash
-files_sync pin paper b 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
+ffsl-sync pin paper b 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
 ```
 
 On the server, run B:
 
 ```bash
 mkdir -p /srv/mirror
-files_sync serve paper b                    # listens on the address from the config
-# or: files_sync serve paper b --listen 0.0.0.0:7777
+ffsl-sync serve paper b                    # listens on the address from the config
+# or: ffsl-sync serve paper b --listen 0.0.0.0:7777
 ```
 
-Until B is pinned, `sync` and `serve` refuse to start: ``replica … has no pinned device id: run `files_sync identity` for it on the host that serves it, then `files_sync pin` …``. Running `identity` again prints the same device ID; it never replaces an identity.
+Until B is pinned, `sync` and `serve` refuse to start: ``replica … has no pinned device id: run `ffsl-sync identity` for it on the host that serves it, then `ffsl-sync pin` …``. Running `identity` again prints the same device ID; it never replaces an identity.
 
 On the laptop, use the pair as usual. `sync --once` and `daemon` connect to the server for replica B:
 
 ```bash
-files_sync sync --once paper
-files_sync daemon paper
+ffsl-sync sync --once paper
+ffsl-sync daemon paper
 ```
 
 The daemon reconnects by itself if the connection drops. Either replica can be remote, or both. With both remote, the syncing host connects to each server on behalf of the other replica, so it needs both identities: `init` makes both there, and prints which `.crt` and `.key` to copy to each server (only that server's own).
 
-A pair made with an older version (0.1.7 or before) keeps working as it is. Its `init` made both identities on the laptop, and both were copied to the server: delete A's `.crt` and `.key` from the server's state directory, since `serve` needs only B's. Those older certificates also carry the name `files_sync replica <id>`, which anyone who connects to `serve` can see; certificates made now carry no name, and the client no longer sends the server name `files-sync` in the clear (SNI). To get rid of the old names, create the pair again.
+A pair made with an older version (0.1.7 or before) keeps working as it is. Its `init` made both identities on the laptop, and both were copied to the server: delete A's `.crt` and `.key` from the server's state directory, since `serve` needs only B's. Those older certificates also carry the name `ffsl-sync replica <id>`, which anyone who connects to `serve` can see; certificates made now carry no name, and the client no longer sends the server name `ffsl-sync` in the clear (SNI). To get rid of the old names, create the pair again.
 
 ### Limits of `serve`
 
@@ -447,7 +472,7 @@ Anyone who can reach `serve`'s port can open a connection, until the TLS handsha
 - **Memory:** a message may take at most 64 MiB of memory once decoded, on top of its own bytes (at most 32 MiB). The list of tombstones at the end of each sync cycle is cut down to the server's own tombstones as it arrives.
 - **Scans:** a scan tells the other side about at most 10 000 paths that changed while it ran (when there are more, their parent directories are rescanned instead) and 10 000 paths it could not scan (the server's log has them all). The same holds for the paths the other side asks to rescan.
 
-These limits are not configurable. Rejected handshakes are logged at `debug` only, since anyone can cause them. To see why the peer cannot connect, run `serve` with `RUST_LOG=info,files_sync::server=debug`.
+These limits are not configurable. Rejected handshakes are logged at `debug` only, since anyone can cause them. To see why the peer cannot connect, run `serve` with `RUST_LOG=info,ffsl_sync::server=debug`.
 
 ### Trying it on one machine
 
@@ -460,27 +485,27 @@ dd if=/dev/urandom of=net/laptop/work/data.bin bs=1M count=3 status=none
 
 # "laptop": create the pair, with B served at 127.0.0.1:47771
 XDG_STATE_HOME="$DEMO/net/laptop-state" \
-  files_sync init paper --a "$DEMO/net/laptop/work" --b "$DEMO/net/server/mirror" \
+  ffsl-sync init paper --a "$DEMO/net/laptop/work" --b "$DEMO/net/server/mirror" \
   --b-remote 127.0.0.1:47771
 
 # copy the config to the "server", make B's identity there, pin it on the "laptop"
-mkdir -p net/server-state/fsync/paper
-cp net/laptop-state/fsync/paper/config.toml net/server-state/fsync/paper/
-B_DEVICE=$(XDG_STATE_HOME="$DEMO/net/server-state" files_sync identity paper b | awk '$1 == "device" { print $2 }')
-XDG_STATE_HOME="$DEMO/net/laptop-state" files_sync pin paper b "$B_DEVICE"
+mkdir -p net/server-state/ffsl-sync/paper
+cp net/laptop-state/ffsl-sync/paper/config.toml net/server-state/ffsl-sync/paper/
+B_DEVICE=$(XDG_STATE_HOME="$DEMO/net/server-state" ffsl-sync identity paper b | awk '$1 == "device" { print $2 }')
+XDG_STATE_HOME="$DEMO/net/laptop-state" ffsl-sync pin paper b "$B_DEVICE"
 
 # "server": serve replica B
-XDG_STATE_HOME="$DEMO/net/server-state" files_sync serve paper b &
+XDG_STATE_HOME="$DEMO/net/server-state" ffsl-sync serve paper b &
 sleep 1
 
 # "laptop": sync
-XDG_STATE_HOME="$DEMO/net/laptop-state" files_sync sync --once paper
+XDG_STATE_HOME="$DEMO/net/laptop-state" ffsl-sync sync --once paper
 cmp net/laptop/work/data.bin net/server/mirror/data.bin && echo identical
 ```
 
 ```text
 replica b of "paper" (c9c5677860a0d25b): pinned device 53e86ac3ee77db37c8a3ed6cd1240148e5388cf974fdbc7e5e6315843857131a
-serving replica c9c5677860a0d25b of "paper" (/tmp/fsync-demo/net/server/mirror) on 127.0.0.1:47771
+serving replica c9c5677860a0d25b of "paper" (/tmp/ffsl-sync-demo/net/server/mirror) on 127.0.0.1:47771
 synced "paper": 2 change(s) applied in 1 round(s)
 identical
 ```
@@ -489,7 +514,7 @@ Change one byte of the 3 MiB file and sync again. This time only one block of it
 
 ```sh
 printf 'X' | dd of=net/laptop/work/data.bin bs=1 seek=1000000 conv=notrunc status=none
-XDG_STATE_HOME="$DEMO/net/laptop-state" files_sync sync --once paper
+XDG_STATE_HOME="$DEMO/net/laptop-state" ffsl-sync sync --once paper
 cmp net/laptop/work/data.bin net/server/mirror/data.bin && echo identical
 ```
 
@@ -507,16 +532,16 @@ On the laptop, `status` shows the remote replica as ``served at 127.0.0.1:47771 
 On the server, `status` shows the served replica. While `serve` runs, it holds the index, so `status` reads the report that `serve` saves at start and after each sync cycle:
 
 ```sh
-XDG_STATE_HOME="$DEMO/net/server-state" files_sync status paper
+XDG_STATE_HOME="$DEMO/net/server-state" ffsl-sync status paper
 kill -INT %1
 wait
 ```
 
 ```text
 pair "paper"
-  a: /tmp/fsync-demo/net/laptop/work (replica 5d0b6a3b8c9e1f27)
+  a: /tmp/ffsl-sync-demo/net/laptop/work (replica 5d0b6a3b8c9e1f27)
     on the client host, not here (run `status` there)
-  b: /tmp/fsync-demo/net/server/mirror (replica c9c5677860a0d25b)
+  b: /tmp/ffsl-sync-demo/net/server/mirror (replica c9c5677860a0d25b)
     served here on 127.0.0.1:47771 (`serve` running; its report from 2026-10-03 20:31:07 CEST)
     index:       2 entries (0 tombstones)
     conflicts:   0
@@ -533,7 +558,7 @@ After `serve` stopped, `status` reads the index itself and says ``served here at
 
 ```sh
 echo sandboxed > d/a/s.txt
-files_sync --sandbox sync --once live
+ffsl-sync --sandbox sync --once live
 cat d/b/s.txt
 ```
 
@@ -544,17 +569,17 @@ sandboxed
 
 **Logging** goes to stderr and is controlled by `RUST_LOG`. The default is `info`, which also prints each replica's filesystem feature check and a one-line summary per sync cycle. Some useful values:
 - `RUST_LOG=warn`: warnings and errors only.
-- `RUST_LOG=files_sync=debug`: detailed per-path decisions, for bug reports, and the bytes sent and received over the network.
-- `RUST_LOG=info,files_sync::server=debug` for `serve`: also the connections it rejected before or during their TLS handshake, and why (see [Limits of `serve`](#limits-of-serve)).
+- `RUST_LOG=ffsl_sync=debug`: detailed per-path decisions, for bug reports, and the bytes sent and received over the network.
+- `RUST_LOG=info,ffsl_sync::server=debug` for `serve`: also the connections it rejected before or during their TLS handshake, and why (see [Limits of `serve`](#limits-of-serve)).
 
 ## 9. Command reference
 
 ```text
-files_sync [--sandbox] <COMMAND>
+ffsl-sync [--sandbox] <COMMAND>
 
 init <PAIR> --a <DIR> --b <DIR> [--a-remote HOST:PORT] [--b-remote HOST:PORT]
     Create a pair. Writes the config and the TLS identities this host needs
-    into $XDG_STATE_HOME/fsync/<PAIR>/: not the one of a replica served
+    into $XDG_STATE_HOME/ffsl-sync/<PAIR>/: not the one of a replica served
     elsewhere while the other is local (see `identity`). Refuses to
     overwrite an existing pair. PAIR may contain ASCII letters, digits, '.',
     '_' and '-' (max 64 bytes, not starting with '.').
@@ -590,11 +615,11 @@ serve <PAIR> <a|b> [--listen HOST:PORT]
 
 `sync --once` and `daemon` add `, N sent as delta` to their summary when files were sent as block-level deltas.
 
-If the reader of stdout goes away (`files_sync status docs | head -3`), a command stops printing and exits with status 141 (128 + SIGPIPE, as a shell shows for a program killed by the signal) after finishing its work. A `daemon` or `serve` keeps running; only its output is lost.
+If the reader of stdout goes away (`ffsl-sync status docs | head -3`), a command stops printing and exits with status 141 (128 + SIGPIPE, as a shell shows for a program killed by the signal) after finishing its work. A `daemon` or `serve` keeps running; only its output is lost.
 
 ## 10. Config file reference
 
-`$XDG_STATE_HOME/fsync/<pair>/config.toml`, as written by `init`:
+`$XDG_STATE_HOME/ffsl-sync/<pair>/config.toml`, as written by `init`:
 
 ```toml
 name = "docs"
@@ -610,7 +635,7 @@ keep_dirlinks = false              # rsync -K
 keep_dirlinks_unsafe = false       # with keep_dirlinks: also links to directories outside the root
 followed_write = "replace"         # replace | conflict (incoming change to a followed link)
 # trust_peer_links = false         # unset: trust the other replica's links if it is local, not over the network (§6)
-trash_days = 0                     # keep replaced/deleted files in .~fsync.trash this many days (0: no trash)
+trash_days = 0                     # keep replaced/deleted files in .~ffsl.trash this many days (0: no trash)
 device = "cdfacff3…"               # pinned TLS certificate hash; set by init, identity or pin
 # remote = "host:7777"             # set by init --a-remote: replica is served there
 
@@ -633,7 +658,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 - owner and group, ACLs, extended attributes;
 - hard links: each name is synced as a separate file;
 - FIFOs, sockets and device files: they are skipped, and the same path on the other side is left alone;
-- names starting with `.~fsync.` (temp files, and the root marker of [§2](#2-concepts));
+- names starting with `.~ffsl.` (temp files, and the root marker of [§2](#2-concepts));
 - paths longer than 4095 bytes (`PATH_MAX`), counted from the replica root: each is reported as `path longer than PATH_MAX; not synced`, and nothing beneath it is synced. Version 0.1.14 and older recorded them, but could not sync them, and could run out of stack or open files on a very deep tree (issue #14).
 - anything on another filesystem mounted inside a replica root: the mount point is not crossed and is reported as an error. A file mounted there (a single-file bind mount, as Docker makes) is reported as `mount point inside the replica; not synced`.
 
@@ -656,21 +681,21 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | A required filesystem feature is missing | The root is on an unsupported filesystem (e.g. `/mnt/c` under WSL, NFS). Move it to ext4, xfs, btrfs or tmpfs. |
 | `index database: Database already open. Cannot acquire lock.` | Another `sync`, `daemon` or `serve` for the same pair holds the index. Run one at a time. |
 | `status`: `index in use (a daemon?), and no report at …` (or ``index in use (by `serve`?)``) | Another process holds the index but has not saved a status report, e.g. a `sync --once` that is still running. Run `status` again when it has finished. |
-| A command exits with status 141 | Its stdout was closed early (e.g. `files_sync status docs \| head -3`). Its work was done; only the rest of its output was dropped. See [§9](#9-command-reference). |
+| A command exits with status 141 | Its stdout was closed early (e.g. `ffsl-sync status docs \| head -3`). Its work was done; only the rest of its output was dropped. See [§9](#9-command-reference). |
 | `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s, then less and less often while it stays so) retries it. |
 | `content does not match its hash, though the file looks unchanged; rehashing it` | A program changed the file without changing its modification time (through a memory mapping, for example). The file is read again and synced as changed. |
 | A daemon logs `sync cycle failed; opening the replicas again` | A cycle failed as a whole, e.g. on a disk error or a full disk (also the one holding the state directory). The daemon opens the replicas again after a wait, and goes on. Free some space or fix the disk; nothing else is needed. See [§5](#5-continuous-sync-with-the-daemon). |
-| `Too many open files` | A sync holds files open while it works. Version 0.1.11 and older ran out of open files when one sync replaced or deleted more than a few hundred files (issue #11). Now `files_sync` raises its limit on open files to the hard limit (`ulimit -Hn`), and holds on to fewer replaced files when the limit is low. If you still see it, raise the hard limit, e.g. with `LimitNOFILE=` in a systemd unit. |
+| `Too many open files` | A sync holds files open while it works. Version 0.1.11 and older ran out of open files when one sync replaced or deleted more than a few hundred files (issue #11). Now `ffsl-sync` raises its limit on open files to the hard limit (`ulimit -Hn`), and holds on to fewer replaced files when the limit is low. If you still see it, raise the hard limit, e.g. with `LimitNOFILE=` in a systemd unit. |
 | `Permission denied` for a path inside a read-only directory | The directory is read-only on the side receiving the change, so nothing can be added to it or removed from it there. This happens when the other side made it writable, changed its content and made it read-only again, all between two syncs. Make the directory writable on that side (`chmod u+w`), sync, then make it read-only again. |
 | `version counter at its limit` | A replica sent version counters at their limit (2^62), which only a damaged index or a misbehaving replica does. The pair can no longer record changes. Stop everything that runs for the pair, delete both indexes `<replica-id>.redb` (on both hosts, for a network pair), and sync: this starts over as described in **Lost or restored index** in [§2](#2-concepts). Version 0.1.14 and older stored the counter, and then failed to read its index (`bad index`). |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
 | Warning `this replica was synced before, but its index is new (lost or deleted?)` | The replica's index was deleted (or lost) since its last sync. Its files were kept: differences with the other side are pushed there or become conflict copies, and files deleted since the last sync come back. See **Lost or restored index** in [§2](#2-concepts). |
 | `held back N deletion(s) in …: more than 50% of its M entries` | One side lost most of its files since the last sync, and the mass-deletion guard kept the other side from following. If that was intended, run `sync --once --allow-mass-delete`. See [§2](#2-concepts). |
-| `replica … has no pinned device id` | The replica is served elsewhere, and its identity has not been made and pinned yet. Run `files_sync identity <pair> <a\|b>` on the host that serves it, then `files_sync pin <pair> <a\|b> <DEVICE-ID>` with the ID it prints on this host. See [Deployment](#deployment). |
+| `replica … has no pinned device id` | The replica is served elsewhere, and its identity has not been made and pinned yet. Run `ffsl-sync identity <pair> <a\|b>` on the host that serves it, then `ffsl-sync pin <pair> <a\|b> <DEVICE-ID>` with the ID it prints on this host. See [Deployment](#deployment). |
 | `replica …'s identity is on this host` (from `pin`) | This host runs the replica, or made its identity: its device ID is pinned already. Pin the other replica's, or run `pin` on the other host. |
 | `replica … has a pinned device id, but its identity is not in …` (from `identity`) | The replica's identity was made on another host. Run `identity` on the host that serves the replica. |
-| `sync` cannot connect to `serve`, and `serve` logs nothing about it | `serve` logs rejected TLS handshakes (e.g. a certificate that is not the pinned one) at `debug` only. Run it with `RUST_LOG=info,files_sync::server=debug`. A host with 4 handshakes in progress (e.g. a port scanner on the same address) gets its new connections closed at once, until its handshakes end (at most 10 s). See [Limits of `serve`](#limits-of-serve). |
+| `sync` cannot connect to `serve`, and `serve` logs nothing about it | `serve` logs rejected TLS handshakes (e.g. a certificate that is not the pinned one) at `debug` only. Run it with `RUST_LOG=info,ffsl_sync::server=debug`. A host with 4 handshakes in progress (e.g. a port scanner on the same address) gets its new connections closed at once, until its handshakes end (at most 10 s). See [Limits of `serve`](#limits-of-serve). |
 | `serve` warns `too many connections; closing a new one` | The peer has 64 connections open at once. It needs 2 or 3; check for many `sync` or `daemon` processes of the pair. |
-| `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. If you renamed the directory holding them before that, they are dealt with as soon as a scan finds the directory under its new name. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. `.~fsync.trash` is the trash, if `trash_days` is set. |
-| I need a file back that a sync replaced or deleted | Look in `.~fsync.trash` at the top of that replica's root, if `trash_days` is set there (see **Trash** in [§2](#2-concepts)). Otherwise it is gone, unless the other replica still has it. Consider turning the trash on. |
+| `.~ffsl.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. If you renamed the directory holding them before that, they are dealt with as soon as a scan finds the directory under its new name. `.~ffsl.root.<replica-id>` at the top of a root is the root marker: keep it. `.~ffsl.trash` is the trash, if `trash_days` is set. |
+| I need a file back that a sync replaced or deleted | Look in `.~ffsl.trash` at the top of that replica's root, if `trash_days` is set there (see **Trash** in [§2](#2-concepts)). Otherwise it is gone, unless the other replica still has it. Consider turning the trash on. |

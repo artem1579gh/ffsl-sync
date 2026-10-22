@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-`files_sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M11 are implemented, and every task in `claude/tasks.md` is done.
+`ffsl-sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M11 are implemented, and every task in `claude/tasks.md` is done.
 
 - **Design:** [`claude/design.md`](claude/design.md). It is the source of truth; keep it updated when you deviate from it.
 - **Task list:** [`claude/tasks.md`](claude/tasks.md). Its tasks are designed to be done one per session, without prior context.
@@ -53,7 +53,7 @@ To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks fo
   - When in doubt, **preserve user data as a conflict copy**. Never unlink something you haven't verified.
 - **Data handling:**
   - Paths and symlink targets are raw bytes (`[u8]`/`OsStr`), never `String`/`str`.
-  - The `.~fsync.` name prefix is reserved for temp, quarantine and probe files. The scanner and watcher must ignore it.
+  - The `.~ffsl.` name prefix is reserved for temp, quarantine and probe files. The scanner and watcher must ignore it.
   - The engine (`src/engine/`) does no I/O itself; it talks only to the `Replica` trait. Precondition (CAS) checks run inside the replica, so the network version stays race-free.
 - **Code and tests:**
   - No tokio: use std threads plus `crossbeam-channel`.
@@ -69,4 +69,4 @@ To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks fo
 
 - Library and binary in one crate: `src/lib.rs` + `src/main.rs`. Errors use `thiserror` in the library and `anyhow` in the binary. Logging uses `tracing`.
 - Conflict copy naming: `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`.
-- State (index, journal, config) lives in `$XDG_STATE_HOME/fsync/<pair>/`, never inside a replica root.
+- State (index, journal, config) lives in `$XDG_STATE_HOME/ffsl-sync/<pair>/`, never inside a replica root.

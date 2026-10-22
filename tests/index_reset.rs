@@ -8,9 +8,9 @@ mod harness;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use files_sync::config::SymlinkPolicy;
-use files_sync::index::IndexStore;
-use files_sync::replica::proto::PROTOCOL_VERSION;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::index::IndexStore;
+use ffsl_sync::replica::proto::PROTOCOL_VERSION;
 use harness::{ID_A, ID_B, Mode, Pair};
 
 fn pair(m: Mode) -> Pair {

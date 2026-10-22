@@ -9,11 +9,11 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use files_sync::config::SymlinkPolicy;
-use files_sync::engine::{Engine, Side};
-use files_sync::replica::Replica;
-use files_sync::replica::proto::PROTOCOL_VERSION;
-use files_sync::scan::Scope;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::engine::{Engine, Side};
+use ffsl_sync::replica::Replica;
+use ffsl_sync::replica::proto::PROTOCOL_VERSION;
+use ffsl_sync::scan::Scope;
 use harness::{Mode, Pair, When};
 
 fn pair(m: Mode) -> Pair {

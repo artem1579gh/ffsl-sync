@@ -25,7 +25,7 @@
 //!   [`Event::Overflow`] every [`InotifySource::LIMIT_POLL`], each of which
 //!   tries to watch the whole tree again too. Once that succeeds (the limit
 //!   was raised, or directories were removed), polling stops.
-//! - Reserved `.~fsync.` names are ignored. Symlinks are never followed
+//! - Reserved `.~ffsl.` names are ignored. Symlinks are never followed
 //!   while watching the tree.
 //! - **Followed links** (design §4.5): the replica hands over its followed
 //!   links with an fd on each referent ([`EventSource::follow`]). The
@@ -510,7 +510,7 @@ mod tests {
         let d = dir.path();
         fs::create_dir_all(d.join("a/b")).unwrap();
         fs::write(d.join("a/b/f"), "x").unwrap();
-        fs::create_dir(d.join(".~fsync.tmp")).unwrap();
+        fs::create_dir(d.join(".~ffsl.tmp")).unwrap();
         symlink("a", d.join("link")).unwrap();
         let mut src = source(d);
         // The root, a, a/b; never the reserved directory or the symlink.
@@ -519,7 +519,7 @@ mod tests {
 
         fs::write(d.join("a/b/f"), "y").unwrap();
         fs::write(d.join("top"), "t").unwrap();
-        fs::write(d.join("a/.~fsync.0123"), "ignored").unwrap();
+        fs::write(d.join("a/.~ffsl.0123"), "ignored").unwrap();
         let ev = collect(&mut src, &["a/b/f", "top"]);
         assert!(
             !ev.iter()

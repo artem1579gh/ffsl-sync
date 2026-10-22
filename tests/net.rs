@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use files_sync::config::{self, PairConfig};
-use files_sync::tls::{DeviceId, Identity};
+use ffsl_sync::config::{self, PairConfig};
+use ffsl_sync::tls::{DeviceId, Identity};
 use tempfile::TempDir;
 
 fn bin(state_home: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_files_sync"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ffsl-sync"));
     cmd.args(args)
         .env("XDG_STATE_HOME", state_home)
         .env_remove("RUST_LOG");
@@ -72,7 +72,7 @@ fn files(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     while let Some(dir) = stack.pop() {
         for e in fs::read_dir(&dir).unwrap() {
             let e = e.unwrap();
-            if e.file_name().to_string_lossy().starts_with(".~fsync.") {
+            if e.file_name().to_string_lossy().starts_with(".~ffsl.") {
                 continue;
             }
             let path = e.path();
@@ -118,7 +118,7 @@ impl Hosts {
             &["init", "p", "--a", a, "--b", b, "--b-remote", "127.0.0.1:9"],
         );
         assert!(out.contains("served at 127.0.0.1:9"), "{out}");
-        assert!(out.contains("files_sync identity p b"), "{out}");
+        assert!(out.contains("ffsl-sync identity p b"), "{out}");
         let (from, to) = (
             hosts.pair_dir(hosts.client.path()),
             hosts.pair_dir(hosts.server.path()),
@@ -179,7 +179,7 @@ impl Hosts {
         args.extend(["serve", "p", "b", "--listen", "127.0.0.1:0"]);
         let mut child = bin(self.server.path(), &args)
             // Rejected handshakes are logged at debug (issue #5).
-            .env("RUST_LOG", "info,files_sync::server=debug")
+            .env("RUST_LOG", "info,ffsl_sync::server=debug")
             .stdout(Stdio::piped())
             .stderr(log)
             .spawn()
@@ -304,7 +304,7 @@ fn serve_needs_an_address_and_an_identity() {
 /// shared config marks remote), the client its local one.
 #[test]
 fn sandboxed_serve_and_sync() {
-    if files_sync::sandbox::abi().is_none() {
+    if ffsl_sync::sandbox::abi().is_none() {
         eprintln!("landlock unsupported here; skipping");
         return;
     }
@@ -332,7 +332,7 @@ fn sync_once_reports_delta_transfers() {
     cfg.replicas[1].remote = Some(addr);
     hosts.set_cfg(&cfg);
 
-    let size = 2 * files_sync::engine::executor::DELTA_MIN_SIZE as usize;
+    let size = 2 * ffsl_sync::engine::executor::DELTA_MIN_SIZE as usize;
     let mut data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
     fs::write(ra.join("data.bin"), &data).unwrap();
     let out = ok(hosts.client.path(), &["sync", "--once", "p"]);
@@ -424,7 +424,7 @@ fn a_served_replica_needs_its_own_identity_and_a_pin() {
     };
     let e = err(client.path(), &["sync", "--once", "p"]);
     assert!(
-        e.contains("no pinned device id") && e.contains("files_sync identity"),
+        e.contains("no pinned device id") && e.contains("ffsl-sync identity"),
         "{e}"
     );
 

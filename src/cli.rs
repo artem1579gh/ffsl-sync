@@ -96,7 +96,7 @@ enum Command {
     /// directory there, run `identity` for that replica there, `pin` the
     /// device ID it prints here, and run `serve` for it there.
     Init {
-        /// Name of the pair; its state lives in $XDG_STATE_HOME/fsync/<PAIR>/.
+        /// Name of the pair; its state lives in $XDG_STATE_HOME/ffsl-sync/<PAIR>/.
         pair: String,
         /// Root directory of replica A (on its server's host if remote).
         #[arg(long = "a", value_name = "DIR")]
@@ -265,7 +265,7 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
                     let (crt, key) = Identity::paths(&pair_dir, r.id);
                     outln!(
                         "     served at {addr}: copy {}, {} and {} to {} on that host, \
-                         then run `files_sync serve {pair} {side}` there",
+                         then run `ffsl-sync serve {pair} {side}` there",
                         path.display(),
                         crt.display(),
                         key.display(),
@@ -274,9 +274,9 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
                 } else {
                     outln!(
                         "     served at {addr}: copy {} to {} on that host, run \
-                         `files_sync identity {pair} {side}` there, pin the device ID it \
-                         prints here with `files_sync pin {pair} {side} <DEVICE-ID>`, \
-                         then run `files_sync serve {pair} {side}` there",
+                         `ffsl-sync identity {pair} {side}` there, pin the device ID it \
+                         prints here with `ffsl-sync pin {pair} {side} <DEVICE-ID>`, \
+                         then run `ffsl-sync serve {pair} {side}` there",
                         path.display(),
                         pair_dir.display()
                     );
@@ -394,7 +394,7 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
             outln!("  device {device}");
             if r.is_remote() && !cfg.replicas[1 - side.index()].is_remote() {
                 outln!(
-                    "  on the host that syncs the pair, pin it with: files_sync pin {pair} {} {device}",
+                    "  on the host that syncs the pair, pin it with: ffsl-sync pin {pair} {} {device}",
                     side.name()
                 );
             }
@@ -562,7 +562,7 @@ fn print_status(cfg: &PairConfig, st: &PairStatus) {
 }
 
 /// Waits until the replaced old inodes in quarantine can be unlinked
-/// (§5.3 step 4(f)), so a one-shot sync leaves no `.~fsync.old.*` files
+/// (§5.3 step 4(f)), so a one-shot sync leaves no `.~ffsl.old.*` files
 /// behind. Gives up, with a warning, after a few grace periods.
 fn drain_quarantine(replicas: &mut [&mut dyn Housekeeping]) {
     let give_up = Instant::now() + 10 * Quarantine::DEFAULT_GRACE;
@@ -651,7 +651,7 @@ fn print_report(cfg: &PairConfig, report: &SyncReport) {
             outln!("    … and {} more", h.paths.len() - HELD_BACK_SHOWN);
         }
         outln!(
-            "    if these deletions are intended, apply them with: files_sync sync --once --allow-mass-delete {}",
+            "    if these deletions are intended, apply them with: ffsl-sync sync --once --allow-mass-delete {}",
             cfg.name
         );
     }

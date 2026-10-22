@@ -17,7 +17,7 @@
 //!   mtimes.
 //! - **Convergence.** At most 3 full sync cycles until one applies nothing;
 //!   then [`Pair::assert_converged`]: equal trees and version vectors, no
-//!   echo, and no `.~fsync.*` names once the quarantine grace has passed.
+//!   echo, and no `.~ffsl.*` names once the quarantine grace has passed.
 //!
 //! **The user model.** A writer resolves the parent of each path beneath its
 //! tree's root without following symlinks (`openat2`), as a careful program
@@ -66,11 +66,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::RecvTimeoutError;
-use files_sync::config::SymlinkPolicy;
-use files_sync::daemon::{CycleReport, Daemon};
-use files_sync::fs::commit::Quarantine;
-use files_sync::fs::is_conflict_name;
-use files_sync::sandbox;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::daemon::{CycleReport, Daemon};
+use ffsl_sync::fs::commit::Quarantine;
+use ffsl_sync::fs::is_conflict_name;
+use ffsl_sync::sandbox;
 use harness::Pair;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags};
 use rustix::io::Errno;

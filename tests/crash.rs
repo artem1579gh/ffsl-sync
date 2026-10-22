@@ -10,7 +10,7 @@
 //! `std::process::abort()` at exactly that point: no destructors, no
 //! cleanup, like a crash. Afterwards the parent checks that:
 //!
-//! - every reserved (`.~fsync.*`) name left on disk is named by an intent in
+//! - every reserved (`.~ffsl.*`) name left on disk is named by an intent in
 //!   the journal of its replica (the journal is always written first);
 //! - reopening the replicas (which replays the journals) and sweeping the
 //!   quarantines leaves no reserved name at all;
@@ -43,9 +43,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use files_sync::config::SymlinkPolicy;
-use files_sync::fs::{hooks, is_reserved, is_root_marker};
-use files_sync::index::IndexStore;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::fs::{hooks, is_reserved, is_root_marker};
+use ffsl_sync::index::IndexStore;
 use harness::{ID_A, ID_B, Node, Opts, Pair};
 
 /// Tells the test binary it runs as a crash child, and what to do.

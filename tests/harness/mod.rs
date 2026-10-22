@@ -18,21 +18,21 @@ use std::sync::{Arc, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Receiver;
-use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
-use files_sync::engine::{Engine, Side, SyncReport};
-use files_sync::fs::{FileKind, RelPath, is_reserved, is_root_marker};
-use files_sync::index::{Entry, Kind, PeerState, VersionVector};
-use files_sync::replica::proto::PROTOCOL_VERSION;
-use files_sync::replica::{
+use ffsl_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
+use ffsl_sync::engine::{Engine, Side, SyncReport};
+use ffsl_sync::fs::{FileKind, RelPath, is_reserved, is_root_marker};
+use ffsl_sync::index::{Entry, Kind, PeerState, VersionVector};
+use ffsl_sync::replica::proto::PROTOCOL_VERSION;
+use ffsl_sync::replica::{
     Blocks, ContentReader, Delta, Housekeeping, LocalReplica, Op, Outcome, Precondition,
     RemoteReplica, Replica,
 };
-use files_sync::scan::{ScanStats, Scope};
-use files_sync::server::{Server, ServerHandle};
-use files_sync::status::ReplicaStatus;
-use files_sync::symlink::{Treatment, classify, is_munged, unmunge};
-use files_sync::tls::Identity;
-use files_sync::watch::Hint;
+use ffsl_sync::scan::{ScanStats, Scope};
+use ffsl_sync::server::{Server, ServerHandle};
+use ffsl_sync::status::ReplicaStatus;
+use ffsl_sync::symlink::{Treatment, classify, is_munged, unmunge};
+use ffsl_sync::tls::Identity;
+use ffsl_sync::watch::Hint;
 
 /// Defines each listed test function, a `fn(Mode)`, as two tests:
 /// `local::name` and `remote::name` (design §9: every suite runs in both
@@ -267,11 +267,11 @@ impl Replica for TestReplica {
         self.get().id()
     }
 
-    fn scan(&mut self, scope: Scope) -> files_sync::Result<ScanStats> {
+    fn scan(&mut self, scope: Scope) -> ffsl_sync::Result<ScanStats> {
         self.get_mut().scan(scope)
     }
 
-    fn changes_since(&self, seq: u64) -> files_sync::Result<Vec<(RelPath, Entry)>> {
+    fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.get().changes_since(seq)
     }
 
@@ -279,7 +279,7 @@ impl Replica for TestReplica {
         &self,
         path: &RelPath,
         expect: &Entry,
-    ) -> files_sync::Result<Box<dyn ContentReader>> {
+    ) -> ffsl_sync::Result<Box<dyn ContentReader>> {
         self.get().open_read(path, expect)
     }
 
@@ -289,7 +289,7 @@ impl Replica for TestReplica {
         op: Op,
         pre: Precondition,
         content: Option<&mut dyn Read>,
-    ) -> files_sync::Result<Outcome> {
+    ) -> ffsl_sync::Result<Outcome> {
         self.get_mut().apply(path, op, pre, content)
     }
 
@@ -297,7 +297,7 @@ impl Replica for TestReplica {
         self.get_mut().watch()
     }
 
-    fn adopt(&mut self, path: &RelPath) -> files_sync::Result<bool> {
+    fn adopt(&mut self, path: &RelPath) -> ffsl_sync::Result<bool> {
         self.get_mut().adopt(path)
     }
 
@@ -306,15 +306,15 @@ impl Replica for TestReplica {
         peer: ReplicaId,
         tombstones: Vec<(RelPath, VersionVector, PeerState)>,
         retention: Duration,
-    ) -> files_sync::Result<Vec<RelPath>> {
+    ) -> ffsl_sync::Result<Vec<RelPath>> {
         self.get_mut().record_sync(peer, tombstones, retention)
     }
 
-    fn clock(&self) -> files_sync::Result<u64> {
+    fn clock(&self) -> ffsl_sync::Result<u64> {
         self.get().clock()
     }
 
-    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+    fn witness(&mut self, floor: u64) -> ffsl_sync::Result<()> {
         self.get_mut().witness(floor)
     }
 
@@ -322,7 +322,7 @@ impl Replica for TestReplica {
         self.get().is_remote()
     }
 
-    fn blocks(&self, path: &RelPath, expect: &Kind) -> files_sync::Result<Option<Blocks>> {
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> ffsl_sync::Result<Option<Blocks>> {
         self.get().blocks(path, expect)
     }
 
@@ -331,7 +331,7 @@ impl Replica for TestReplica {
         path: &RelPath,
         expect: &Kind,
         blocks: &[u32],
-    ) -> files_sync::Result<Box<dyn ContentReader>> {
+    ) -> ffsl_sync::Result<Box<dyn ContentReader>> {
         self.get().read_blocks(path, expect, blocks)
     }
 
@@ -342,7 +342,7 @@ impl Replica for TestReplica {
         pre: Precondition,
         delta: &Delta,
         data: &mut dyn Read,
-    ) -> files_sync::Result<Outcome> {
+    ) -> ffsl_sync::Result<Outcome> {
         self.get_mut().apply_delta(path, op, pre, delta, data)
     }
 }
@@ -363,7 +363,7 @@ impl Housekeeping for TestReplica {
         }
     }
 
-    fn status(&self, peer: ReplicaId) -> files_sync::Result<ReplicaStatus> {
+    fn status(&self, peer: ReplicaId) -> ffsl_sync::Result<ReplicaStatus> {
         match self {
             TestReplica::Local(r) => r.status(peer),
             TestReplica::Remote { client, .. } => client.status(peer),
@@ -686,7 +686,7 @@ impl Pair {
     ///   ([`Tree::synced`]: file content, mode and mtime; directory mode;
     ///   symlink targets, unmunged; followed links as what they point to);
     /// - the live index entries are equal, version vectors included;
-    /// - no reserved (`.~fsync.`) names are left, and nothing is quarantined;
+    /// - no reserved (`.~ffsl.`) names are left, and nothing is quarantined;
     /// - a full rescan of either replica changes nothing (no echo).
     pub fn assert_converged(&mut self) {
         for t in [&mut self.a, &mut self.b] {
@@ -764,11 +764,11 @@ impl Replica for Racing<'_> {
         self.inner.id()
     }
 
-    fn scan(&mut self, scope: Scope) -> files_sync::Result<ScanStats> {
+    fn scan(&mut self, scope: Scope) -> ffsl_sync::Result<ScanStats> {
         self.inner.scan(scope)
     }
 
-    fn changes_since(&self, seq: u64) -> files_sync::Result<Vec<(RelPath, Entry)>> {
+    fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.inner.changes_since(seq)
     }
 
@@ -776,7 +776,7 @@ impl Replica for Racing<'_> {
         &self,
         path: &RelPath,
         expect: &Entry,
-    ) -> files_sync::Result<Box<dyn ContentReader>> {
+    ) -> ffsl_sync::Result<Box<dyn ContentReader>> {
         self.fire(When::Read, path);
         self.inner.open_read(path, expect)
     }
@@ -787,7 +787,7 @@ impl Replica for Racing<'_> {
         op: Op,
         pre: Precondition,
         content: Option<&mut dyn Read>,
-    ) -> files_sync::Result<Outcome> {
+    ) -> ffsl_sync::Result<Outcome> {
         self.fire(When::Apply, path);
         self.inner.apply(path, op, pre, content)
     }
@@ -796,7 +796,7 @@ impl Replica for Racing<'_> {
         self.inner.watch()
     }
 
-    fn adopt(&mut self, path: &RelPath) -> files_sync::Result<bool> {
+    fn adopt(&mut self, path: &RelPath) -> ffsl_sync::Result<bool> {
         self.inner.adopt(path)
     }
 
@@ -805,15 +805,15 @@ impl Replica for Racing<'_> {
         peer: ReplicaId,
         tombstones: Vec<(RelPath, VersionVector, PeerState)>,
         retention: Duration,
-    ) -> files_sync::Result<Vec<RelPath>> {
+    ) -> ffsl_sync::Result<Vec<RelPath>> {
         self.inner.record_sync(peer, tombstones, retention)
     }
 
-    fn clock(&self) -> files_sync::Result<u64> {
+    fn clock(&self) -> ffsl_sync::Result<u64> {
         self.inner.clock()
     }
 
-    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+    fn witness(&mut self, floor: u64) -> ffsl_sync::Result<()> {
         self.inner.witness(floor)
     }
 
@@ -821,7 +821,7 @@ impl Replica for Racing<'_> {
         self.inner.is_remote()
     }
 
-    fn blocks(&self, path: &RelPath, expect: &Kind) -> files_sync::Result<Option<Blocks>> {
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> ffsl_sync::Result<Option<Blocks>> {
         self.inner.blocks(path, expect)
     }
 
@@ -830,7 +830,7 @@ impl Replica for Racing<'_> {
         path: &RelPath,
         expect: &Kind,
         blocks: &[u32],
-    ) -> files_sync::Result<Box<dyn ContentReader>> {
+    ) -> ffsl_sync::Result<Box<dyn ContentReader>> {
         self.fire(When::Read, path);
         self.inner.read_blocks(path, expect, blocks)
     }
@@ -842,7 +842,7 @@ impl Replica for Racing<'_> {
         pre: Precondition,
         delta: &Delta,
         data: &mut dyn Read,
-    ) -> files_sync::Result<Outcome> {
+    ) -> ffsl_sync::Result<Outcome> {
         self.fire(When::Apply, path);
         self.inner.apply_delta(path, op, pre, delta, data)
     }

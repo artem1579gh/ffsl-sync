@@ -15,16 +15,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use files_sync::config::{ReplicaId, SymlinkPolicy};
-use files_sync::daemon::{CycleReport, Daemon, DaemonStats};
-use files_sync::fs::{RelPath, is_reserved};
-use files_sync::index::{Entry, PeerState, VersionVector};
-use files_sync::replica::{
+use ffsl_sync::config::{ReplicaId, SymlinkPolicy};
+use ffsl_sync::daemon::{CycleReport, Daemon, DaemonStats};
+use ffsl_sync::fs::{RelPath, is_reserved};
+use ffsl_sync::index::{Entry, PeerState, VersionVector};
+use ffsl_sync::replica::{
     ContentReader, Housekeeping, LocalReplica, Op, Outcome, Precondition, Replica,
 };
-use files_sync::scan::{ScanStats, Scope};
-use files_sync::status::ReplicaStatus;
-use files_sync::watch::{ChannelSource, Event, Hint};
+use ffsl_sync::scan::{ScanStats, Scope};
+use ffsl_sync::status::ReplicaStatus;
+use ffsl_sync::watch::{ChannelSource, Event, Hint};
 use harness::{ID_A, ID_B, Pair, open_replica};
 
 /// What a test sees while the daemon runs.
@@ -342,7 +342,7 @@ fn followed_referents_are_watched() {
 }
 
 /// Makes the error a scan fails with.
-type ScanFault = fn() -> files_sync::Error;
+type ScanFault = fn() -> ffsl_sync::Error;
 
 /// How a [`Flaky`] replica fails (issue #12).
 #[derive(Clone, Default)]
@@ -364,14 +364,14 @@ impl Replica for Flaky {
         self.inner.id()
     }
 
-    fn scan(&mut self, scope: Scope) -> files_sync::Result<ScanStats> {
+    fn scan(&mut self, scope: Scope) -> ffsl_sync::Result<ScanStats> {
         if let Some(fail) = *self.faults.scan.lock().unwrap() {
             return Err(fail());
         }
         self.inner.scan(scope)
     }
 
-    fn changes_since(&self, seq: u64) -> files_sync::Result<Vec<(RelPath, Entry)>> {
+    fn changes_since(&self, seq: u64) -> ffsl_sync::Result<Vec<(RelPath, Entry)>> {
         self.inner.changes_since(seq)
     }
 
@@ -379,13 +379,13 @@ impl Replica for Flaky {
         &self,
         path: &RelPath,
         expect: &Entry,
-    ) -> files_sync::Result<Box<dyn ContentReader>> {
+    ) -> ffsl_sync::Result<Box<dyn ContentReader>> {
         if self
             .faults
             .stuck
             .is_some_and(|s| path.as_bytes() == s.as_bytes())
         {
-            return Err(files_sync::Error::Unstable {
+            return Err(ffsl_sync::Error::Unstable {
                 path: path.as_bytes().to_vec(),
                 reason: "stuck",
             });
@@ -399,7 +399,7 @@ impl Replica for Flaky {
         op: Op,
         pre: Precondition,
         content: Option<&mut dyn Read>,
-    ) -> files_sync::Result<Outcome> {
+    ) -> ffsl_sync::Result<Outcome> {
         self.inner.apply(path, op, pre, content)
     }
 
@@ -412,15 +412,15 @@ impl Replica for Flaky {
         peer: ReplicaId,
         tombstones: Vec<(RelPath, VersionVector, PeerState)>,
         retention: Duration,
-    ) -> files_sync::Result<Vec<RelPath>> {
+    ) -> ffsl_sync::Result<Vec<RelPath>> {
         self.inner.record_sync(peer, tombstones, retention)
     }
 
-    fn clock(&self) -> files_sync::Result<u64> {
+    fn clock(&self) -> ffsl_sync::Result<u64> {
         self.inner.clock()
     }
 
-    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+    fn witness(&mut self, floor: u64) -> ffsl_sync::Result<()> {
         self.inner.witness(floor)
     }
 }
@@ -434,7 +434,7 @@ impl Housekeeping for Flaky {
         self.inner.sweep();
     }
 
-    fn status(&self, peer: ReplicaId) -> files_sync::Result<ReplicaStatus> {
+    fn status(&self, peer: ReplicaId) -> ffsl_sync::Result<ReplicaStatus> {
         self.inner.status(peer)
     }
 }
@@ -491,7 +491,7 @@ impl FlakyPair {
         &self,
         daemon: Daemon,
         f: impl FnOnce(&Receiver<CycleReport>) -> R,
-    ) -> (R, files_sync::Result<DaemonStats>) {
+    ) -> (R, ffsl_sync::Result<DaemonStats>) {
         let (tx, reports) = crossbeam_channel::unbounded();
         let daemon = daemon.reports(tx);
         let open = || {
@@ -512,8 +512,8 @@ impl FlakyPair {
 
 /// What every index operation fails with after a write failed (`ENOSPC`,
 /// `EIO`), until the database is opened again.
-fn index_io_failed() -> files_sync::Error {
-    files_sync::Error::Db(redb::Error::PreviousIo)
+fn index_io_failed() -> ffsl_sync::Error {
+    ffsl_sync::Error::Db(redb::Error::PreviousIo)
 }
 
 /// Issue #12: a cycle that fails with an error that may pass (here the
@@ -550,7 +550,7 @@ fn a_bad_index_ends_the_daemon() {
         Daemon::new().restart_delay(Duration::from_millis(10)),
         |r| {
             r.recv_timeout(START).expect("first cycle");
-            *pair.faults.scan.lock().unwrap() = Some(|| files_sync::Error::BadIndex {
+            *pair.faults.scan.lock().unwrap() = Some(|| ffsl_sync::Error::BadIndex {
                 reason: "test".into(),
             });
             fs::write(pair.path(0, "after.txt"), "after").unwrap();
@@ -558,7 +558,7 @@ fn a_bad_index_ends_the_daemon() {
         },
     );
     assert!(
-        matches!(res, Err(files_sync::Error::BadIndex { .. })),
+        matches!(res, Err(ffsl_sync::Error::BadIndex { .. })),
         "{res:?}"
     );
     assert_eq!(pair.reopened.load(Ordering::Relaxed), 0);

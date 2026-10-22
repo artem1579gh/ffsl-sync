@@ -10,17 +10,17 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use files_sync::config::{self, PairConfig, ReplicaId};
-use files_sync::engine::Engine;
-use files_sync::fs::RelPath;
-use files_sync::fs::commit::FileMeta;
-use files_sync::index::{PeerState, VersionVector};
-use files_sync::replica::proto::{
+use ffsl_sync::config::{self, PairConfig, ReplicaId};
+use ffsl_sync::engine::Engine;
+use ffsl_sync::fs::RelPath;
+use ffsl_sync::fs::commit::FileMeta;
+use ffsl_sync::index::{PeerState, VersionVector};
+use ffsl_sync::replica::proto::{
     Content, Request, Response, client_handshake, read_frame, write_frame,
 };
-use files_sync::replica::{LocalReplica, Op, Precondition, RemoteReplica, Replica};
-use files_sync::server::{Limits, Server, ServerHandle};
-use files_sync::tls::{Identity, server_name};
+use ffsl_sync::replica::{LocalReplica, Op, Precondition, RemoteReplica, Replica};
+use ffsl_sync::server::{Limits, Server, ServerHandle};
+use ffsl_sync::tls::{Identity, server_name};
 use rustls::{ClientConnection, StreamOwned};
 use tempfile::TempDir;
 
@@ -65,7 +65,7 @@ impl Fx {
     }
 
     /// B, as A reaches it.
-    fn client(&self) -> files_sync::Result<RemoteReplica> {
+    fn client(&self) -> ffsl_sync::Result<RemoteReplica> {
         RemoteReplica::connect(&self.cfg.replicas[1], &self.cfg.replicas[0], &self.pair_dir)
     }
 

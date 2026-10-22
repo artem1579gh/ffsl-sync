@@ -106,7 +106,7 @@ const PURGE_EVERY: Duration = Duration::from_secs(3600);
 impl LocalReplica {
     /// Opens the replica `config`: its root, its capabilities (probed,
     /// logged, and required, §1) and its index under `pair_dir`
-    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Refuses a root
+    /// (`$XDG_STATE_HOME/ffsl-sync/<pair>/`, which must exist). Refuses a root
     /// that holds `pair_dir` or lies inside it ([`layout::check`], issue #6).
     /// Checks the root marker (§5.1, [`ensure_root_marker`]). Then replays the journal
     /// (§5.8): commits a crash interrupted are finished or undone, and
@@ -3341,7 +3341,7 @@ mod tests {
             LocalReplica::open(&cfg, tempfile::tempdir().unwrap().path()).unwrap(),
         ));
         // A crashed commit's staged file, recorded but never finished.
-        let staged = dir.join(".~fsync.00000000000000aa");
+        let staged = dir.join(".~ffsl.00000000000000aa");
         fs::write(&staged, b"partial").unwrap();
         {
             let index = IndexStore::open(&IndexStore::path_for(&state, ME), ME).unwrap();
@@ -3352,7 +3352,7 @@ mod tests {
                     op: crate::index::IntentOp::Create,
                     path: rp("g"),
                     parent: Fingerprint::of_fd(root.fd()).unwrap(),
-                    tmp: b".~fsync.00000000000000aa".to_vec(),
+                    tmp: b".~ffsl.00000000000000aa".to_vec(),
                     old: None,
                     expected: None,
                     staged: None,

@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-/// Errors returned by the `files_sync` library.
+/// Errors returned by the `ffsl-sync` library.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An I/O error, with a short description of what was being attempted.

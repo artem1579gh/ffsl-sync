@@ -1,7 +1,7 @@
 //! Pair configuration: the two replica roots, their IDs and per-replica symlink
 //! policy flags (design §2, §4).
 //!
-//! The config lives at `$XDG_STATE_HOME/fsync/<pair>/config.toml`, outside both
+//! The config lives at `$XDG_STATE_HOME/ffsl-sync/<pair>/config.toml`, outside both
 //! replica roots. The functions here take the state home explicitly so tests do
 //! not depend on the process environment; [`state_home`] reads it from the
 //! environment for the CLI.
@@ -127,7 +127,7 @@ pub struct ReplicaConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_peer_links: Option<bool>,
     /// Keep the files this replica's syncs replace or delete in its trash
-    /// (`.~fsync.trash` at the top of the root) for this many days, instead
+    /// (`.~ffsl.trash` at the top of the root) for this many days, instead
     /// of unlinking them; 0 (the default) means no trash (T31).
     #[serde(default)]
     pub trash_days: u64,
@@ -192,8 +192,8 @@ impl ReplicaConfig {
     pub fn device(&self) -> Result<DeviceId> {
         self.device.ok_or_else(|| Error::Tls {
             reason: format!(
-                "replica {} has no pinned device id: run `files_sync identity` for it \
-                 on the host that serves it, then `files_sync pin` with the device id \
+                "replica {} has no pinned device id: run `ffsl-sync identity` for it \
+                 on the host that serves it, then `ffsl-sync pin` with the device id \
                  it prints on the other host",
                 self.id
             ),
@@ -520,7 +520,7 @@ pub fn pin_device(
         return Err(Error::Tls {
             reason: format!(
                 "replica {}'s identity is on this host ({}); its device id is pinned \
-                 by `files_sync identity`, not by hand",
+                 by `ffsl-sync identity`, not by hand",
                 r.id,
                 key.display()
             ),
@@ -587,13 +587,13 @@ pub fn state_home_from(
         .ok_or(Error::NoStateHome)
 }
 
-/// `<state_home>/fsync/<pair>`: the pair's index, journal and config.
+/// `<state_home>/ffsl-sync/<pair>`: the pair's index, journal and config.
 pub fn pair_dir(state_home: &Path, pair: &str) -> Result<PathBuf> {
     validate_pair_name(pair)?;
-    Ok(state_home.join("fsync").join(pair))
+    Ok(state_home.join("ffsl-sync").join(pair))
 }
 
-/// `<state_home>/fsync/<pair>/config.toml`.
+/// `<state_home>/ffsl-sync/<pair>/config.toml`.
 pub fn config_path(state_home: &Path, pair: &str) -> Result<PathBuf> {
     Ok(pair_dir(state_home, pair)?.join(CONFIG_FILE))
 }
@@ -638,10 +638,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<(
         .create(dir)
         .map_err(|e| Error::io(format!("create {}", dir.display()), e))?;
 
-    // A reserved name (`.~fsync.`), which no scan picks up.
+    // A reserved name (`.~ffsl.`), which no scan picks up.
     let name = path.file_name().expect("config path has a file name");
     let tmp = dir.join(format!(
-        ".~fsync.{}.tmp.{}.{}",
+        ".~ffsl.{}.tmp.{}.{}",
         name.to_string_lossy(),
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -762,7 +762,7 @@ mod tests {
     fn init_round_trips() {
         let (state, ra, rb) = (tempdir(), tempdir(), tempdir());
         let (cfg, path) = init(state.path(), "docs", ra.path(), rb.path()).unwrap();
-        assert!(path.ends_with("fsync/docs/config.toml"));
+        assert!(path.ends_with("ffsl-sync/docs/config.toml"));
         assert_ne!(cfg.replicas[0].id, cfg.replicas[1].id);
         assert_eq!(cfg.replicas[0].root, fs::canonicalize(ra.path()).unwrap());
         assert_eq!(cfg.replicas[0].symlinks, SymlinkPolicy::Links);
@@ -975,7 +975,7 @@ mod tests {
             (ra.path(), ra.path()),
             (ra.path(), &nested),
             (ra.path(), &file),
-            (ra.path(), Path::new("/nonexistent/fsync-test")),
+            (ra.path(), Path::new("/nonexistent/ffsl-test")),
         ];
         for (a, b) in cases {
             let err = init(state.path(), "p", a, b).unwrap_err();
@@ -988,7 +988,7 @@ mod tests {
         let rb = tempdir();
         let err = init(ra.path(), "p", rb.path(), ra.path()).unwrap_err();
         assert!(matches!(err, Error::InvalidRoot { .. }), "{err}");
-        assert!(!ra.path().join("fsync").exists());
+        assert!(!ra.path().join("ffsl-sync").exists());
     }
 
     #[test]

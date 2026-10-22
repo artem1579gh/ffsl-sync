@@ -1,7 +1,7 @@
 //! Filesystem feature checks (design §1 environment caveat, §5.3).
 //!
 //! [`Caps::probe`] runs each check as a real, harmless operation inside the
-//! replica root, using `.~fsync.probe.<tag>.*` names that are removed again
+//! replica root, using `.~ffsl.probe.<tag>.*` names that are removed again
 //! afterwards. Only names this probe created, still holding an inode it
 //! created, are ever unlinked.
 
@@ -17,8 +17,8 @@ use crate::fs::lease::Lease;
 use crate::fs::root::Root;
 use crate::fs::stat::Fingerprint;
 
-/// Name prefix of probe files; inside the reserved `.~fsync.` namespace.
-pub const PROBE_PREFIX: &str = ".~fsync.probe.";
+/// Name prefix of probe files; inside the reserved `.~ffsl.` namespace.
+pub const PROBE_PREFIX: &str = ".~ffsl.probe.";
 
 /// What the filesystem under a replica root supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 
 /// The server name rustls needs for a client connection. Certificates are
 /// pinned, so it is never checked, and it is not sent (no SNI).
-pub const SERVER_NAME: &str = "files-sync";
+pub const SERVER_NAME: &str = "ffsl-sync";
 
 /// Identifies a replica's certificate: the blake3 hash of its DER encoding.
 /// Written as 64 hex digits.

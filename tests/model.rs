@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 
-use files_sync::config::{ReplicaId, SymlinkPolicy};
-use files_sync::engine::{Engine, Side};
+use ffsl_sync::config::{ReplicaId, SymlinkPolicy};
+use ffsl_sync::engine::{Engine, Side};
 use harness::{ID_A, ID_B, Mode, Pair, Tree, id7};
 use proptest::prelude::*;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
@@ -69,7 +69,7 @@ enum Op {
 
 /// Targets: relative, nested, escaping, absolute (dangling) and the link's
 /// own directory. Under `Links` all are synced verbatim and never followed.
-const TARGETS: [&str; 5] = ["a", "b/a", "../a", "/nonexistent/fsync-model", "."];
+const TARGETS: [&str; 5] = ["a", "b/a", "../a", "/nonexistent/ffsl-model", "."];
 
 fn arb_path() -> impl Strategy<Value = String> {
     prop::collection::vec(prop::sample::select(vec!["a", "b"]), 1..=3).prop_map(|c| c.join("/"))

@@ -301,7 +301,7 @@ impl Root {
     }
 
     /// Lists the directory `p` (the root included), sorted by name, without
-    /// `.` and `..`. Reserved `.~fsync.` names are included; callers filter.
+    /// `.` and `..`. Reserved `.~ffsl.` names are included; callers filter.
     pub fn read_dir(&self, p: &RelPath) -> Result<Vec<DirEntry>> {
         let dir = self.open_dir(p)?;
         let mut entries = Vec::new();
@@ -524,7 +524,7 @@ mod tests {
             ".hidden",
             "..x",
             "x..",
-            "a/.~fsync.1",
+            "a/.~ffsl.1",
             "a b",
         ] {
             RelPath::new(ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));

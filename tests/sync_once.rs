@@ -2,9 +2,9 @@
 
 mod harness;
 
-use files_sync::config::SymlinkPolicy;
-use files_sync::engine::Side;
-use files_sync::index::Kind;
+use ffsl_sync::config::SymlinkPolicy;
+use ffsl_sync::engine::Side;
+use ffsl_sync::index::Kind;
 use harness::{ID_A, ID_B, Mode, Pair, When, id7};
 
 fn pair(m: Mode) -> Pair {

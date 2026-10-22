@@ -1,5 +1,5 @@
 [package]
-name = "files_sync"
+name = "ffsl-sync"
 version = "0.1.15"
 edition = "2024"
 

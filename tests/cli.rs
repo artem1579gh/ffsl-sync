@@ -1,15 +1,15 @@
-//! End-to-end tests of the `files_sync` binary.
+//! End-to-end tests of the `ffsl-sync` binary.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use files_sync::config::PairConfig;
-use files_sync::fs::is_root_marker;
-use files_sync::fs::tmpname::TRASH_DIR;
+use ffsl_sync::config::PairConfig;
+use ffsl_sync::fs::is_root_marker;
+use ffsl_sync::fs::tmpname::TRASH_DIR;
 
 fn run(state_home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_files_sync"))
+    Command::new(env!("CARGO_BIN_EXE_ffsl-sync"))
         .args(args)
         .env("XDG_STATE_HOME", state_home)
         .env_remove("RUST_LOG")
@@ -211,7 +211,7 @@ fn trash_keeps_what_a_sync_replaces_or_deletes() {
 
     assert_eq!(std::fs::read(b.path().join("d/doc.txt")).unwrap(), b"v2");
     assert_eq!(names(b.path()), ["d"]);
-    let trash = b.path().join(".~fsync.trash");
+    let trash = b.path().join(".~ffsl.trash");
     let top = names(&trash);
     assert_eq!(top.len(), 2, "{top:?}");
     assert_eq!(top[0], "d");
@@ -224,13 +224,13 @@ fn trash_keeps_what_a_sync_replaces_or_deletes() {
     );
     assert_eq!(std::fs::read(trash.join("d").join(&d[0])).unwrap(), b"v1");
     // A has no trash.
-    assert!(!a.path().join(".~fsync.trash").exists());
+    assert!(!a.path().join(".~ffsl.trash").exists());
 }
 
 /// `--sandbox` (landlock) still lets a sync write the roots and the state.
 #[test]
 fn sandboxed_sync_and_status() {
-    if files_sync::sandbox::abi().is_none() {
+    if ffsl_sync::sandbox::abi().is_none() {
         eprintln!("landlock unsupported here; skipping");
         return;
     }
@@ -281,7 +281,7 @@ fn daemon_syncs_until_a_signal_stops_it() {
         let state = tempfile::tempdir().unwrap();
         let (a, b) = init_pair(state.path(), "p");
         std::fs::write(a.path().join("before"), "1").unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_files_sync"))
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ffsl-sync"))
             .args(["daemon", "p"])
             .env("XDG_STATE_HOME", state.path())
             .env_remove("RUST_LOG")
@@ -392,7 +392,7 @@ fn a_large_cycle_stays_within_the_open_file_limit() {
         std::fs::write(a.path().join(file(i)), "new").unwrap();
     }
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_files_sync"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ffsl-sync"));
     cmd.args(["sync", "--once", "p"])
         .env("XDG_STATE_HOME", state.path())
         .env_remove("RUST_LOG");
@@ -451,7 +451,7 @@ fn sync_requires_initialised_pair() {
 fn run_closed_stdout(state: &Path, args: &[&str]) -> Output {
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    Command::new(env!("CARGO_BIN_EXE_files_sync"))
+    Command::new(env!("CARGO_BIN_EXE_ffsl-sync"))
         .args(args)
         .env("XDG_STATE_HOME", state)
         .env_remove("RUST_LOG")
@@ -480,7 +480,7 @@ fn closed_stdout_exits_quietly() {
     // A daemon keeps syncing; only its stop summary is lost.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_files_sync"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffsl-sync"))
         .args(["daemon", "p"])
         .env("XDG_STATE_HOME", state.path())
         .env_remove("RUST_LOG")
@@ -515,7 +515,7 @@ fn sandbox_is_refused_where_it_does_not_apply() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--sandbox applies to"), "{stderr}");
-    assert!(!state.path().join("fsync").exists());
+    assert!(!state.path().join("ffsl-sync").exists());
     ok(state.path(), &["init", "p", "--a", a, "--b", b]);
     for args in [
         &["--sandbox", "identity", "p", "a"][..],

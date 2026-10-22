@@ -12,7 +12,7 @@
 //!   swaps back if it was modified in between. A verified old inode goes into
 //!   [`Quarantine`] rather than being unlinked at once;
 //! - **delete** (§5.6) pins and checks the object, moves it aside to a
-//!   `.~fsync.del.` name with `RENAME_NOREPLACE`, verifies it, and quarantines
+//!   `.~ffsl.del.` name with `RENAME_NOREPLACE`, verifies it, and quarantines
 //!   it, or moves it back if it was modified in between;
 //! - **rmdir** (§5.7) relies on `unlinkat(AT_REMOVEDIR)` as an atomic
 //!   emptiness check;
@@ -235,7 +235,7 @@ pub fn replace_symlink(
 
 /// Deletes the file or symlink at `path`, which must match `expected` (§5.6).
 ///
-/// The object is moved aside to a `.~fsync.del.` name, verified, and then
+/// The object is moved aside to a `.~ffsl.del.` name, verified, and then
 /// quarantined like a replaced inode, so a write through an fd held across
 /// the delete becomes a conflict copy rather than being lost. If it was
 /// modified before it was moved aside, it goes back to `path` (or, if the
@@ -318,7 +318,7 @@ pub fn rename_to(
     if tmpname::is_reserved(to_name) {
         return Err(Error::InvalidPath {
             path: to.as_bytes().to_vec(),
-            reason: "reserved `.~fsync.` name",
+            reason: "reserved `.~ffsl.` name",
         });
     }
     let t = Target::resolve(ctx.root, path)?;
@@ -587,8 +587,8 @@ pub fn create_root_marker(root: &Root, replica: ReplicaId) -> Result<bool> {
     };
     point("marker.created");
     let text = format!(
-        "This directory is the root of files_sync replica {replica}.\n\
-         Keep this file: without it, files_sync refuses to sync the directory.\n"
+        "This directory is the root of ffsl-sync replica {replica}.\n\
+         Keep this file: without it, ffsl-sync refuses to sync the directory.\n"
     );
     let mut file = std::fs::File::from(fd);
     let io_err = |e| Error::io(format!("write root marker in {}", root.path().display()), e);
@@ -633,7 +633,7 @@ impl<'a> Target<'a> {
         if tmpname::is_reserved(name) {
             return Err(Error::InvalidPath {
                 path: path.as_bytes().to_vec(),
-                reason: "reserved `.~fsync.` name",
+                reason: "reserved `.~ffsl.` name",
             });
         }
         let parent_fp = Fingerprint::of_fd(parent.as_fd())?;
@@ -2003,7 +2003,7 @@ fn put_back(
 // Quarantine (§5.3 step 4(f))
 // ---------------------------------------------------------------------------
 
-/// Old inodes replaced by a commit, kept as `.~fsync.old.<id>` until it is
+/// Old inodes replaced by a commit, kept as `.~ffsl.old.<id>` until it is
 /// safe to unlink them.
 ///
 /// Someone may still hold an fd (or a writable mmap) on a replaced file and
@@ -2071,7 +2071,7 @@ struct Pending {
     replica_dir: RelPath,
     /// The name the inode was replaced at, for conflict names.
     orig: Vec<u8>,
-    /// Its current `.~fsync.old.<id>` name.
+    /// Its current `.~ffsl.old.<id>` name.
     name: Vec<u8>,
     /// The old inode as verified; size and mtime must stay the same.
     fp: Fingerprint,
@@ -3079,7 +3079,7 @@ mod tests {
     fn reserved_names_and_root_are_refused() {
         let fx = Fx::new();
         assert!(matches!(
-            create(&fx, ".~fsync.0123456789abcdef", b"x"),
+            create(&fx, ".~ffsl.0123456789abcdef", b"x"),
             Err(Error::InvalidPath { .. })
         ));
         assert!(matches!(
@@ -4170,9 +4170,9 @@ mod tests {
 
     // ----- T31: trash --------------------------------------------------
 
-    /// The names in the trash directory `rel` (beneath `.~fsync.trash`).
+    /// The names in the trash directory `rel` (beneath `.~ffsl.trash`).
     fn trash_ls(fx: &Fx, rel: &str) -> Vec<String> {
-        let dir = fx.p(".~fsync.trash").join(rel);
+        let dir = fx.p(".~ffsl.trash").join(rel);
         let mut names: Vec<_> = fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -4206,7 +4206,7 @@ mod tests {
             "{names:?}"
         );
         assert!(names[1].starts_with("g~"), "{names:?}");
-        let trashed = |n: &str| fs::read(fx.p(".~fsync.trash/d").join(n)).unwrap();
+        let trashed = |n: &str| fs::read(fx.p(".~ffsl.trash/d").join(n)).unwrap();
         assert_eq!(trashed(&names[0]), b"old");
         assert_eq!(trashed(&names[1]), b"gone");
 
@@ -4227,7 +4227,7 @@ mod tests {
         let outside: Vec<_> = fx
             .leftovers()
             .into_iter()
-            .filter(|p| !p.starts_with(fx.p(".~fsync.trash")))
+            .filter(|p| !p.starts_with(fx.p(".~ffsl.trash")))
             .collect();
         assert_eq!(outside, Vec::<PathBuf>::new());
 
@@ -4244,7 +4244,7 @@ mod tests {
     fn trash_symlink_is_not_followed() {
         let fx = Fx::new();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), fx.p(".~fsync.trash")).unwrap();
+        symlink(outside.path(), fx.p(".~ffsl.trash")).unwrap();
         let f = fx.user_file("f", b"old");
         let mut q = quarantine();
         q.set_trash(&fx.root).unwrap();
@@ -4256,11 +4256,11 @@ mod tests {
         assert!(purge_trash(&fx.root, Duration::ZERO).is_err());
 
         // A real trash, with a symlink where the file's directory would go.
-        fs::remove_file(fx.p(".~fsync.trash")).unwrap();
-        fs::create_dir(fx.p(".~fsync.trash")).unwrap();
+        fs::remove_file(fx.p(".~ffsl.trash")).unwrap();
+        fs::create_dir(fx.p(".~ffsl.trash")).unwrap();
         fs::create_dir(fx.p("d")).unwrap();
         let g = fx.user_file("d/g", b"g");
-        symlink(outside.path(), fx.p(".~fsync.trash/d")).unwrap();
+        symlink(outside.path(), fx.p(".~ffsl.trash/d")).unwrap();
         assert_eq!(del(&fx, &mut q, "d/g", &g).unwrap(), Outcome::Removed);
         let report = q.sweep();
         assert_eq!(report.trashed, 1, "only f: {report:?}");
@@ -4281,7 +4281,7 @@ mod tests {
     fn trash_races() {
         let fx = Fx::new();
         let outside = tempfile::tempdir().unwrap();
-        fs::create_dir_all(fx.p(".~fsync.trash/d")).unwrap();
+        fs::create_dir_all(fx.p(".~ffsl.trash/d")).unwrap();
         fs::create_dir(fx.p("d")).unwrap();
         let f = fx.user_file("d/f", b"old");
         let mut held = fs::File::options().append(true).open(fx.p("d/f")).unwrap();
@@ -4289,7 +4289,7 @@ mod tests {
         q.set_trash(&fx.root).unwrap();
         applied(replace(&fx, &mut q, "d/f", &f, b"new").unwrap());
 
-        let (trash, out) = (fx.p(".~fsync.trash"), outside.path().to_path_buf());
+        let (trash, out) = (fx.p(".~ffsl.trash"), outside.path().to_path_buf());
         let _move = hooks::once("trash.before_rename", move || {
             fs::rename(trash.join("d"), trash.join("d-moved")).unwrap();
             symlink(&out, trash.join("d")).unwrap();
@@ -4308,19 +4308,19 @@ mod tests {
         assert_eq!(report.trashed, 1, "{report:?}");
         let moved = trash_ls(&fx, "d-moved");
         assert_eq!(moved.len(), 1, "{moved:?}");
-        let kept = fs::read(fx.p(".~fsync.trash/d-moved").join(&moved[0])).unwrap();
+        let kept = fs::read(fx.p(".~ffsl.trash/d-moved").join(&moved[0])).unwrap();
         assert_eq!(kept, b"old late");
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
 
         // A purge that finds a new arrival keeps it, and the directory.
-        fs::remove_file(fx.p(".~fsync.trash/d")).unwrap();
-        let arrival = fx.p(".~fsync.trash/d-moved/new");
+        fs::remove_file(fx.p(".~ffsl.trash/d")).unwrap();
+        let arrival = fx.p(".~ffsl.trash/d-moved/new");
         let _arrive = hooks::once("trash.before_purge", move || {
             fs::write(&arrival, b"just trashed").unwrap();
         });
         purge_trash(&fx.root, Duration::ZERO).unwrap();
         assert_eq!(
-            fs::read(fx.p(".~fsync.trash/d-moved/new")).unwrap(),
+            fs::read(fx.p(".~ffsl.trash/d-moved/new")).unwrap(),
             b"just trashed"
         );
     }
@@ -4420,7 +4420,7 @@ mod tests {
         let fx = Fx::new();
         let exp = fx.user_file("f", b"data");
         fs::create_dir(fx.p("d")).unwrap();
-        for to in ["d/f", "f", ".~fsync.x"] {
+        for to in ["d/f", "f", ".~ffsl.x"] {
             let out = ren(&fx, "f", &exp, to);
             assert!(
                 matches!(out, Err(Error::InvalidPath { .. })),
