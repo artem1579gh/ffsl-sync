@@ -98,3 +98,11 @@ cargo test --release --test scale -- --ignored --nocapture --test-threads=1   # 
 ```
 
 Development is organised as a sequence of self-contained tasks in [`claude/tasks.md`](claude/tasks.md).
+
+## License
+
+Copyright (C) 2026 artem1579gh
+
+ffsl-sync is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [`LICENSE`](LICENSE) for the full text.
+
+Contributions are accepted under the same license.
