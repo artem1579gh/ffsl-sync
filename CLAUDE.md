@@ -39,6 +39,7 @@ To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks fo
   - Set `version` in `Cargo.toml`, and run `cargo build` so `Cargo.lock` follows.
   - Add a note at the **top** of `release_notes.md`: a `## <version> — YYYY.MM.DD HH:MM:SS` heading with the date and time the note is added, **in UTC** (`date -u '+%Y.%m.%d %H:%M:%S'`), then briefly what the release does.
   - Keep one empty line between notes. Never rewrite older notes.
+- **Tagging:** only when the user explicitly asks, never as part of a release on its own. Tag the release commit with an annotated tag: `git tag -a vX.Y.Z -m "Release X.Y.Z" <commit>`. Tags start with `v0.3.1`; older releases are untagged. The user pushes the tag (`git push origin vX.Y.Z`).
 
 ## Hard rules (these protect race-freedom; do not break them)
 
