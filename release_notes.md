@@ -2,6 +2,13 @@
 
 All times are UTC.
 
+## 0.3.1 — 2026.10.23 09:49:48
+
+ffsl-sync now has a license. Nothing changes in how it syncs, in the config or in the protocol, so a 0.3.1 host still talks to a 0.2.x one.
+
+- **License:** ffsl-sync is free software under the GNU General Public License, version 3 or (at your option) any later version. The full text is in `LICENSE`; contributions are accepted under the same license. Earlier versions were published without a license.
+- **`--version`:** `ffsl-sync --version` (or `-V`) prints the version. It already worked, and is now described in the command reference of `docs/usage.md`, along with `--help`.
+
 ## 0.2.2 — 2026.10.22 19:23:17
 
 Fixes [issue #15](https://github.com/artem1579gh/ffsl-sync/issues/15): on big trees, syncing a small change cost time and memory in proportion to the whole tree. Nothing changes in what is synced, in the config, the CLI or the protocol, so a 0.2.2 host still talks to a 0.2.1 one.
