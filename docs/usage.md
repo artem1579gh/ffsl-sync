@@ -576,6 +576,8 @@ sandboxed
 
 ```text
 ffsl-sync [--sandbox] <COMMAND>
+ffsl-sync --version | -V        Print the version, e.g. `ffsl-sync 0.2.2`.
+ffsl-sync --help | -h           Print help; `<COMMAND> --help` for one command.
 
 init <PAIR> --a <DIR> --b <DIR> [--a-remote HOST:PORT] [--b-remote HOST:PORT]
     Create a pair. Writes the config and the TLS identities this host needs
